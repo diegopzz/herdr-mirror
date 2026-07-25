@@ -198,15 +198,10 @@ target = "work"
                                      # directly (don't drive its pane sizes)
 # enabled = true                     # false stops syncing this host without
                                      # deleting its config; mirrors stay put
-# api_transport = "auto"             # default. Reaches the remote API socket
-                                     # via ssh's streamlocal `-L` forward, and
-                                     # falls back to an exec relay (one ssh
-                                     # exec per API connection, no config
-                                     # needed on the remote beyond socat or
-                                     # python3) if that doesn't work — some
-                                     # sshds accept the forward but never
-                                     # service it. Set "socket" or "exec" to
-                                     # pin one and skip the probe.
+# api_transport = "auto"             # how to reach the remote API socket:
+                                     # "socket" = ssh -L forward, "exec" = relay
+                                     # over ssh exec (needs socat or python3).
+                                     # auto = socket, falling back to exec.
 
 [hosts.vps]                          # add more hosts freely; each is independent
 target = "ssh://niko@203.0.113.7:2222"
