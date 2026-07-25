@@ -82,6 +82,10 @@ const BROADCAST_SUBS: &[&str] = &[
     "pane.created",
     "pane.closed",
     "pane.exited",
+    // a bare remote resize (no pane created/closed) has no other event to
+    // hang a converge off of; falls into the generic converge_at branch below
+    // like any subscription this daemon doesn't special-case.
+    "layout.updated",
 ];
 
 fn sub_list(pane_ids: &[String]) -> Vec<Value> {
@@ -406,6 +410,10 @@ async fn local_events_task(
             json!({ "type": "workspace.created" }),
             json!({ "type": "workspace.closed" }),
             json!({ "type": "pane.closed" }),
+            // resizing a mirror pane locally is an edit the remote should
+            // follow on a host we drive; the poke below is what gets it there
+            // promptly instead of on the next unrelated event
+            json!({ "type": "layout.updated" }),
         ];
         match local.subscribe(subs).await {
             Ok(mut stream) => {
