@@ -62,10 +62,14 @@ pub struct AgentInfo {
     pub pane_id: String,
     pub agent: Option<String>,
     pub display_agent: Option<String>,
-    // snapshot agents carry this as `name`; the pane_agent_status_changed event
-    // carries the same title as `title`, so accept either
-    #[serde(alias = "title")]
     pub name: Option<String>,
+    /// the pane's reported title (`agents[].title`, and what the
+    /// pane_agent_status_changed event carries). Its own field, not an alias on
+    /// `name`: the remote sets them independently, and an alias funnels both
+    /// keys into one slot, a duplicate-field error that fails the whole
+    /// snapshot parse, not just this row.
+    #[serde(default)]
+    pub title: Option<String>,
     /// the remote's live terminal title (e.g. a coding agent's current task
     /// summary), stripped of spinner/status glyphs. Only present on hosts new
     /// enough to publish it — default so older remotes still parse.
@@ -93,11 +97,13 @@ impl AgentInfo {
     /// The single `title` slot `pane.report_metadata` accepts. A remote agent
     /// with a user-given `name` keeps showing it (unchanged behavior — don't
     /// bury a name the user picked under an ever-changing task title). Only
-    /// when there's no name do we fall back to the remote's live terminal
-    /// title, so a mirrored agent's current task is visible instead of blank.
+    /// when there's no name do we fall back to the pane's reported title, then
+    /// to the remote's live terminal title, so a mirrored agent's current task
+    /// is visible instead of blank.
     pub fn effective_title(&self) -> Option<&str> {
         self.name
             .as_deref()
+            .or(self.title.as_deref())
             .or(self.terminal_title_stripped.as_deref())
             .or(self.terminal_title.as_deref())
     }
@@ -1286,7 +1292,8 @@ mod tests {
     /// The `pane_agent_status_changed` event (herdr app/api.rs) must deserialize
     /// into AgentInfo cleanly, or flush_status would fall back to a default (no
     /// agent) and wrongly retract the mirror's agent. Note the event carries the
-    /// title as `title`; the snapshot uses `name` — the alias bridges them.
+    /// title as `title`, which lands in its own field and still reaches the
+    /// reported title slot through `effective_title`.
     #[test]
     fn agent_status_event_parses_and_keeps_title() {
         let data = json!({
@@ -1303,8 +1310,26 @@ mod tests {
         assert_eq!(info.agent.as_deref(), Some("claude"));
         assert_eq!(info.agent_status.as_deref(), Some("working"));
         assert_eq!(info.display_agent.as_deref(), Some("Claude"));
-        assert_eq!(info.name.as_deref(), Some("fix the bug")); // title -> name
+        assert_eq!(info.title.as_deref(), Some("fix the bug"));
+        assert_eq!(info.effective_title(), Some("fix the bug"));
         assert!(info.has_agent());
+    }
+
+    /// A named agent that also carries a pane title must parse: with `title`
+    /// aliased onto `name` it was a duplicate-field error, which fails the
+    /// whole snapshot parse (`agents` is a Vec) and wedges the host.
+    #[test]
+    fn agent_with_both_name_and_title_parses() {
+        let agents: Vec<AgentInfo> = serde_json::from_value(json!([
+            { "pane_id": "w1:p1", "agent": "claude", "name": "l2-r3", "title": "fix the bug" },
+            { "pane_id": "w1:p2", "agent": "codex" },
+        ]))
+        .expect("a named agent with a pane title must not fail the snapshot parse");
+        assert_eq!(agents.len(), 2);
+        // an explicit name still wins over the pane title
+        assert_eq!(agents[0].effective_title(), Some("l2-r3"));
+        assert_eq!(agents[0].title.as_deref(), Some("fix the bug"));
+        assert_eq!(agents[1].effective_title(), None);
     }
 
     /// A remote agent with a user-given name keeps showing it; only an
