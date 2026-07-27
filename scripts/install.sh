@@ -35,12 +35,30 @@ esac
 ASSET="herdr-mirror-${OS}-${ARCH}"
 BASE="https://github.com/${SLUG}/releases/download/v${VERSION}"
 
+# SHA-256 verifier. coreutils `sha256sum` on Linux and recent macOS; `shasum`
+# (perl Digest::SHA) on older macOS and Debian-family. Neither is universal:
+# Arch's perl ships no /usr/bin/shasum, so requiring it made install fail there.
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256_check() { sha256sum -c -; }
+elif command -v shasum >/dev/null 2>&1; then
+  sha256_check() { shasum -a 256 -c -; }
+else
+  fail "no SHA-256 tool found: install coreutils (sha256sum) or perl (shasum)"
+fi
+
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 echo "fetching ${BASE}/${ASSET}"
 curl -fsSL --retry 2 -o "${TMP}/${ASSET}" "${BASE}/${ASSET}" || fail "download failed: ${BASE}/${ASSET}"
 curl -fsSL --retry 2 -o "${TMP}/SHA256SUMS" "${BASE}/SHA256SUMS" || fail "download failed: ${BASE}/SHA256SUMS"
-(cd "$TMP" && grep " ${ASSET}\$" SHA256SUMS | shasum -a 256 -c -) || fail "checksum verification failed for ${ASSET}"
+
+# Look the hash up first, so a release missing this asset can't be reported as
+# a corrupt download: under `pipefail` a no-match grep fails the whole pipeline
+# and would otherwise land on the mismatch message below.
+EXPECTED="$(grep " ${ASSET}\$" "${TMP}/SHA256SUMS")" ||
+  fail "${ASSET} is not listed in SHA256SUMS — the v${VERSION} release looks incomplete"
+(cd "$TMP" && printf '%s\n' "$EXPECTED" | sha256_check) ||
+  fail "checksum MISMATCH for ${ASSET} — the download is corrupt or tampered with; do not use it"
 
 mkdir -p "$(dirname "$DEST")"
 install -m 755 "${TMP}/${ASSET}" "$DEST"
