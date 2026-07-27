@@ -149,8 +149,13 @@ pub async fn run(env: Env, kind: &str, direction: Option<&str>) -> Result<()> {
     }
 
     let ctx = invocation_context();
-    let config = load_config(&env.config_search)?;
-    let resolved = resolve_context(&env, &config.hosts, &ctx);
+    // Deliberately not `?`: the local fallback below needs no host config, and
+    // these actions are meant to be bound over herdr's native new_tab/split.
+    // Hard-failing here would kill that key for anyone who hasn't written
+    // hosts.toml yet, with an error about SSH hosts they never asked for.
+    let config = load_config(&env.config_search);
+    let resolved =
+        config.as_ref().ok().and_then(|c| resolve_context(&env, &c.hosts, &ctx));
 
     // One key for both worlds: inside a mirror these take the remote path
     // below; anywhere else they degrade to the plain local action instead of
@@ -166,6 +171,8 @@ pub async fn run(env: Env, kind: &str, direction: Option<&str>) -> Result<()> {
             _ => {}
         }
     }
+    // past the fallback every path needs a host, so a bad config is fatal now
+    let config = config?;
 
     if resolved.is_none() && kind != "workspace" {
         return Err(err(format!(
