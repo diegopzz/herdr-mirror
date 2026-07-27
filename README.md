@@ -95,6 +95,11 @@ same rule as native `prefix+shift+n`, but remote): `remote-new-workspace`,
 `remote-new-tab`, `remote-split-right`, `remote-split-down`. The new object
 mirrors back within seconds.
 
+**One key for both worlds** — outside a mirror they degrade to the plain local
+action instead of erroring, so one binding can replace the native key entirely.
+Exception: on a non-mirrored pane inside a mirror workspace, `remote-split-*`
+errors rather than splitting locally, which would desync the mirrored layout.
+
 **Continuous streaming** — every mirror pane streams its remote pane live for
 its whole lifetime, each over its own connection, so panes are never
 blank and a busy pane can't contend with or drop another's stream. Sidebar
@@ -127,9 +132,9 @@ key = "prefix+alt+d"           # destructive: closes ALL mirrors + clears state
 type = "plugin_action"
 command = "mirror.teardown"    # stop mirroring everything (start to resume)
 
-# Create objects on the REMOTE host — run these from inside a mirror pane, which
-# supplies the target host and cwd. Each is herdr's native local key + alt
-# (Option): same muscle memory, but it acts on the remote host.
+# Create objects on the REMOTE host, or locally when invoked outside a mirror.
+# Each is herdr's native local key + alt (Option): same muscle memory, remote
+# target.
 [[keys.command]]
 key = "prefix+alt+n"           # native new_workspace = prefix+shift+n
 type = "plugin_action"
@@ -151,10 +156,39 @@ type = "plugin_action"
 command = "mirror.remote-split-down"
 ```
 
-The `remote-*` actions need a focused mirror pane (except `remote-new-workspace`,
-which falls back to `default_host` when run outside one). The remaining
-actions — `mirror.status`, `mirror.once`, `mirror.teardown`, `mirror.ensure` —
-are lifecycle/diagnostic and are usually run from the CLI rather than bound.
+Outside a mirror, `remote-new-workspace` targets `default_host` and the others
+act locally. The remaining actions — `mirror.status`, `mirror.once`,
+`mirror.ensure` — are lifecycle/diagnostic and are usually run from the CLI
+rather than bound.
+
+**If you live in mirrors, drop the alt variants.** Since these fall back to the
+native behaviour anyway, hand them the native keys and keep one set of muscle
+memory — remote inside a mirror, local everywhere else:
+
+```toml
+[keys]                             # move the natives out of the way
+new_tab = "prefix+shift+c"
+split_vertical = "prefix+shift+v"
+split_horizontal = "prefix+shift+minus"
+
+[[keys.command]]
+key = "prefix+c"                   # was native new_tab
+type = "plugin_action"
+command = "mirror.remote-new-tab"
+
+[[keys.command]]
+key = "prefix+v"                   # was native split_vertical
+type = "plugin_action"
+command = "mirror.remote-split-right"
+
+[[keys.command]]
+key = "prefix+minus"               # was native split_horizontal
+type = "plugin_action"
+command = "mirror.remote-split-down"
+```
+
+The tradeoff: those keys now depend on this plugin being installed and enabled,
+since the native binding no longer covers them.
 
 ### Mouse
 

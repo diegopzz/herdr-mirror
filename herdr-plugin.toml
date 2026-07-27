@@ -1,6 +1,6 @@
 id = "mirror"
 name = "Herdr Mirror"
-version = "0.1.12"
+version = "0.1.13"
 min_herdr_version = "0.7.2"
 description = "Mirror a remote herdr server's workspaces and agents into the local sidebar"
 platforms = ["macos", "linux"]
@@ -37,26 +37,26 @@ command = ["./target/release/herdr-mirror", "once"]
 
 [[actions]]
 id = "remote-new-workspace"
-title = "Mirror: new remote workspace"
-description = "Create a workspace on the remote host (host/cwd inherited from the invoking mirror)"
+title = "Mirror: new workspace"
+description = "New workspace on the remote host (the invoking mirror's host, else hosts.toml default_host)"
 command = ["./target/release/herdr-mirror", "remote-workspace"]
 
 [[actions]]
 id = "remote-new-tab"
-title = "Mirror: new remote tab"
-description = "Create a tab in the remote workspace this mirror reflects"
+title = "Mirror: new tab"
+description = "New tab on the remote when invoked inside a mirror; a plain local tab anywhere else"
 command = ["./target/release/herdr-mirror", "remote-tab"]
 
 [[actions]]
 id = "remote-split-right"
-title = "Mirror: split remote pane right"
-description = "Split the mirrored remote pane to the right"
+title = "Mirror: split right"
+description = "Split the mirrored remote pane right; splits locally when invoked outside a mirror"
 command = ["./target/release/herdr-mirror", "remote-split", "right"]
 
 [[actions]]
 id = "remote-split-down"
-title = "Mirror: split remote pane down"
-description = "Split the mirrored remote pane downward"
+title = "Mirror: split down"
+description = "Split the mirrored remote pane down; splits locally when invoked outside a mirror"
 command = ["./target/release/herdr-mirror", "remote-split", "down"]
 
 [[actions]]
