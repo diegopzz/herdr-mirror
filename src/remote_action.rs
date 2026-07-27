@@ -11,16 +11,19 @@
 // reverse-looked-up in the per-host id maps. Inside a mirror, that pins both
 // the host and the remote object (and the remote pane's own cwd).
 //
-// Outside a mirror the two non-split actions degrade instead of failing, so one
-// key can cover both worlds: `remote-workspace` targets hosts.toml
-// `default_host` (else the first host declared), and `remote-tab` creates a
-// plain local tab, letting it replace native new_tab wholesale. `remote-split`
-// still errors: a local pane inside a mirror workspace would break the
-// invariant layout_sync relies on (the local tree is the remote tree with
-// unmirrored panes pruned).
+// Outside a mirror every action degrades instead of failing, so one key can
+// cover both worlds: `remote-workspace` targets hosts.toml `default_host`
+// (else the first host declared), while `remote-tab` and `remote-split` do the
+// plain local thing, letting them replace native new_tab/split wholesale.
 //
-// These create REMOTE objects only; the daemon mirrors them back within a
-// couple of seconds. Local mirror objects stay daemon-owned.
+// The degrade is gated on NO host matching, not on the pane. Inside a mirror
+// workspace whose focused pane isn't mirrored, `remote-split` still errors
+// rather than splitting locally: layout_sync assumes the local tree is the
+// remote tree with unmirrored panes pruned, so a local pane inside a mirrored
+// tab would silently mis-place later mirrors and skew ratio sync.
+//
+// Anything created inside a mirror is a REMOTE object; the daemon mirrors it
+// back within a couple of seconds. Local mirror objects stay daemon-owned.
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -81,24 +84,31 @@ fn invocation_context() -> InvocationContext {
     ctx
 }
 
+/// cwd for a local fallback, inherited the way native new_tab/split do: shell
+/// bindings carry it directly, plugin actions don't, so fall back to the
+/// focused pane's cwd from the local snapshot.
+async fn local_cwd(
+    api: &crate::api::ApiClient,
+    ctx: &InvocationContext,
+) -> Result<Option<String>> {
+    if let Some(cwd) = std::env::var("HERDR_ACTIVE_PANE_CWD").ok().filter(|s| !s.is_empty()) {
+        return Ok(Some(cwd));
+    }
+    let Some(pane_id) = &ctx.focused_pane_id else { return Ok(None) };
+    let snap = fetch_snapshot(api).await?;
+    Ok(snap
+        .panes
+        .iter()
+        .find(|p| &p.pane_id == pane_id)
+        .and_then(|p| p.foreground_cwd.clone().or_else(|| p.cwd.clone())))
+}
+
 /// The outside-a-mirror fallback for `remote-tab`: a plain local tab in the
 /// invocation workspace, matching native new_tab (cwd inherited from the
 /// focused pane, focused).
 async fn local_tab(env: &Env, ctx: &InvocationContext) -> Result<()> {
     let api = crate::api::ApiClient::connect(&env.local_socket).await?;
-    // shell bindings carry the cwd directly; plugin actions don't, so fall
-    // back to the focused pane's cwd from the local snapshot
-    let mut cwd = std::env::var("HERDR_ACTIVE_PANE_CWD").ok().filter(|s| !s.is_empty());
-    if cwd.is_none() {
-        if let Some(pane_id) = &ctx.focused_pane_id {
-            let snap = fetch_snapshot(&api).await?;
-            cwd = snap
-                .panes
-                .iter()
-                .find(|p| &p.pane_id == pane_id)
-                .and_then(|p| p.foreground_cwd.clone().or_else(|| p.cwd.clone()));
-        }
-    }
+    let cwd = local_cwd(&api, ctx).await?;
     let mut params = json!({ "cwd": cwd, "focus": true });
     if let Some(ws) = &ctx.workspace_id {
         params["workspace_id"] = json!(ws);
@@ -111,23 +121,58 @@ async fn local_tab(env: &Env, ctx: &InvocationContext) -> Result<()> {
     Ok(())
 }
 
+/// The outside-a-mirror fallback for `remote-split`: split the focused local
+/// pane, matching native split_vertical/horizontal. Only ever reached when NO
+/// host matched — inside a mirror an unmirrored focused pane still errors,
+/// because a local pane in a mirrored tab would break the invariant
+/// layout_sync depends on (see the module header).
+async fn local_split(env: &Env, ctx: &InvocationContext, direction: &str) -> Result<()> {
+    let api = crate::api::ApiClient::connect(&env.local_socket).await?;
+    let cwd = local_cwd(&api, ctx).await?;
+    let mut params = json!({ "direction": direction, "cwd": cwd, "focus": true });
+    // no focused pane in context: let herdr split whatever is focused
+    if let Some(pane_id) = &ctx.focused_pane_id {
+        params["target_pane_id"] = json!(pane_id);
+    }
+    let res: Value = api.request("pane.split", params).await?;
+    println!(
+        "split local pane {} {direction} → {}",
+        ctx.focused_pane_id.as_deref().unwrap_or("focused"),
+        res.pointer("/pane/pane_id").and_then(|v| v.as_str()).unwrap_or("?")
+    );
+    Ok(())
+}
+
 pub async fn run(env: Env, kind: &str, direction: Option<&str>) -> Result<()> {
     if kind == "split" && !matches!(direction, Some("right") | Some("down")) {
         return Err(err("remote-split needs a direction: right|down"));
     }
 
     let ctx = invocation_context();
-    let config = load_config(&env.config_search)?;
-    let resolved = resolve_context(&env, &config.hosts, &ctx);
+    // Deliberately not `?`: the local fallback below needs no host config, and
+    // these actions are meant to be bound over herdr's native new_tab/split.
+    // Hard-failing here would kill that key for anyone who hasn't written
+    // hosts.toml yet, with an error about SSH hosts they never asked for.
+    let config = load_config(&env.config_search);
+    let resolved =
+        config.as_ref().ok().and_then(|c| resolve_context(&env, &c.hosts, &ctx));
 
-    // One key for both worlds: inside a mirror this is the remote path below;
-    // anywhere else it degrades to a plain local tab instead of erroring, so it
-    // can replace native new_tab wholesale. Only fires when NO host matched —
-    // in a mirror workspace whose focused pane isn't mirrored we still go
-    // remote, never dropping a local tab into a daemon-owned workspace.
-    if kind == "tab" && resolved.is_none() {
-        return local_tab(&env, &ctx).await;
+    // One key for both worlds: inside a mirror these take the remote path
+    // below; anywhere else they degrade to the plain local action instead of
+    // erroring, so they can replace native new_tab/split wholesale. Only fires
+    // when NO host matched — in a mirror workspace whose focused pane isn't
+    // mirrored we still go remote, never dropping a local object into a
+    // daemon-owned workspace.
+    if resolved.is_none() {
+        match kind {
+            "tab" => return local_tab(&env, &ctx).await,
+            // direction was validated at the top of this fn
+            "split" => return local_split(&env, &ctx, direction.unwrap()).await,
+            _ => {}
+        }
     }
+    // past the fallback every path needs a host, so a bad config is fatal now
+    let config = config?;
 
     if resolved.is_none() && kind != "workspace" {
         return Err(err(format!(
