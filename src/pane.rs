@@ -459,6 +459,9 @@ struct App {
     /// so herdr does native selection/scroll; re-grabbed for a TUI so clicks can
     /// be forwarded.
     mouse_grabbed: bool,
+    /// whether the local pane is currently in application cursor mode (?1h), held
+    /// to match the remote's so forwarded arrows arrive in the form it expects
+    app_cursor_keys: bool,
 }
 
 /// minimum spacing between foreground polls — each is an ssh handshake, so we
@@ -535,6 +538,33 @@ impl App {
         }
         self.mouse_grabbed = want;
         write_stdout(if want { "\x1b[?1002h\x1b[?1006h" } else { "\x1b[?1002l" });
+    }
+
+    /// Match the local pane's cursor-key mode to the remote's, so the arrow bytes
+    /// herdr hands us are already the ones the remote app expects.
+    ///
+    /// Frames carry no DEC modes (see grid.rs), so a remote app in application
+    /// cursor mode (DECCKM, what terminfo `smkx` sets) never moves the local
+    /// pane out of normal mode: herdr encodes Up as CSI A, we forward it
+    /// verbatim, and the remote app is listening for SS3 A. Rather than rewrite
+    /// the bytes in flight, put the LOCAL pane in the same mode and let herdr's
+    /// own encoder produce the right form: it also covers Home/End and anything
+    /// else whose encoding turns on this mode.
+    ///
+    /// The classification is the same shell/TUI proxy the mouse grab uses, for
+    /// the same reason: the API exposes no input modes to ask for directly.
+    fn sync_cursor_key_mode(&mut self) {
+        if !self.tty {
+            return;
+        }
+        // a shell prompt reads arrows in normal mode; a TUI is the case that
+        // sets smkx, so mirror application mode unless we've confirmed a shell
+        let want = self.remote_is_shell == Some(false);
+        if want == self.app_cursor_keys {
+            return;
+        }
+        self.app_cursor_keys = want;
+        write_stdout(if want { "\x1b[?1h" } else { "\x1b[?1l" });
     }
 
     fn observe_size(&self) -> (usize, usize) {
@@ -851,6 +881,9 @@ pub async fn run(args: Args) -> Result<()> {
         fg_poll_at: None,
         settle_at: None,
         mouse_grabbed: tty, // startup wrote ?1002h when we're a tty
+        // startup leaves the pane in normal cursor mode; the first classification
+        // moves it if the remote turns out to be a TUI
+        app_cursor_keys: false,
     };
     app.connect(if app.args.always_control { Mode::Control } else { Mode::Observe }).await;
 
@@ -887,6 +920,7 @@ pub async fn run(args: Args) -> Result<()> {
                     Some(Msg::Foreground(v)) => if v.is_some() {
                         app.remote_is_shell = v;
                         app.sync_mouse_grab();
+                        app.sync_cursor_key_mode();
                     },
                 }
             }
@@ -946,7 +980,9 @@ pub async fn run(args: Args) -> Result<()> {
         unsafe { libc::kill(s.pid, libc::SIGTERM) };
     }
     if tty {
-        write_stdout("\x1b[?1002l\x1b[?1006l\x1b[?25h\x1b[?1049l");
+        // ?1l with the rest: leaving the hosting pane in application cursor mode
+        // would misencode arrows for whatever runs there next
+        write_stdout("\x1b[?1002l\x1b[?1006l\x1b[?1l\x1b[?25h\x1b[?1049l");
     }
     if let Some(raw) = raw {
         raw.restore();
