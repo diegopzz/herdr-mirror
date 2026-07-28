@@ -280,6 +280,27 @@ is a container's resting state — unlike an unreachable ssh host.
 **Multiple containers** each get their own `[hosts.*]` entry and run
 independently, exactly like multiple ssh hosts.
 
+## Sidebar tokens
+
+Custom metadata tokens the remote publishes are forwarded onto the mirror rows,
+so a mirrored workspace or agent carries the same `$name` values a native one
+does under whatever layout you configure locally. Useful for values herdr can't
+derive from a mirror pane at all, like the remote working directory.
+
+On the remote, report the value:
+
+```bash
+herdr pane report-metadata "$HERDR_PANE_ID" \
+  --source user:rcwd --token "rcwd=$PWD" --ttl-ms 3600000
+```
+
+Locally, name it in a sidebar row (`~/.config/herdr/config.toml`):
+
+```toml
+[ui.sidebar.agents]
+rows = [["state_icon", "workspace"], ["state_text", "agent"], ["$rcwd"]]
+```
+
 ## Limitations
 
 - **Version-locked to preview** until the `terminal session` streams reach
