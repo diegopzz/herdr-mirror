@@ -292,6 +292,43 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
 // ---------------------------------------------------------------------------
 // terminal plumbing
 
+/// The layout herdr renders when a server has NO client attached: MIN_COLS x
+/// MIN_ROWS from its headless server. Not a minimum — an attached client
+/// smaller than this gets its real size — it is specifically the placeholder
+/// used when nobody is watching.
+///
+/// Every derivation from it subtracts: sidebar, tab bar, splits, gaps, the
+/// scrollbar gutter. So a pane born under that layout cannot EXCEED it on
+/// either axis, which is what makes this a sound upper bound rather than a
+/// shape to match. Shape matching is the trap: a phone lays out to the same
+/// rectangle as the placeholder.
+const HERDR_NO_CLIENT_LAYOUT: (usize, usize) = (80, 24);
+
+/// Could this pane's size have come from a layout nobody is watching?
+///
+/// Strictly larger on either axis is provably a real viewport. `>` not `>=`:
+/// herdr spawns restored panes at exactly 24x80, so `>=` would trust a
+/// placeholder.
+///
+/// Consulted at birth to pick the initial mode. Deliberately NOT consulted on
+/// the promotion path: a resize is taken as evidence of a client, which holds
+/// in practice but is empirical rather than structural — herdr has one
+/// clientless resize path (its first virtual render), so a pane created in the
+/// instant before that render could in principle promote on a placeholder
+/// resize. It self-heals the moment a client attaches.
+fn size_is_trusted((cols, rows): (usize, usize)) -> bool {
+    cols > HERDR_NO_CLIENT_LAYOUT.0 || rows > HERDR_NO_CLIENT_LAYOUT.1
+}
+
+/// Mode to open with. Split out from `run` so the composition is testable.
+fn initial_mode(always_control: bool, size: (usize, usize)) -> Mode {
+    if always_control && size_is_trusted(size) {
+        Mode::Control
+    } else {
+        Mode::Observe
+    }
+}
+
 fn term_size() -> (usize, usize) {
     unsafe {
         let mut ws: libc::winsize = std::mem::zeroed();
@@ -885,12 +922,32 @@ pub async fn run(args: Args) -> Result<()> {
         // moves it if the remote turns out to be a TUI
         app_cursor_keys: false,
     };
-    app.connect(if app.args.always_control { Mode::Control } else { Mode::Observe }).await;
-
+    // Control is authoritative on the remote: the server resizes the remote pty
+    // to whatever we ask for, beating even a larger live client over there. So
+    // entering Control with a size we cannot vouch for is what let a local herdr
+    // with no client attached drag a healthy remote pane down to its 80x24
+    // placeholder (#23). Observe never resizes anything, so it is the safe place
+    // to wait: the first resize or keystroke proves a human and promotes us.
+    // BEFORE connect: spawning the session awaits a process launch, and a
+    // SIGWINCH arriving in that window is lost outright (its default disposition
+    // is to be ignored). That window is exactly when a client attaching lays out
+    // a freshly created pane — the resize we now promote on. Registered first,
+    // tokio buffers it and delivers it once the loop starts.
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut sighup = signal(SignalKind::hangup())?; // pane closed — don't orphan the ssh child
     let mut sigwinch = signal(SignalKind::window_change())?;
+
+    app.connect(initial_mode(app.args.always_control, term_size())).await;
+    // the pane may have been laid out while the session was spawning; the signal
+    // for that is buffered above, but check directly too
+    if app.mode == Mode::Observe && initial_mode(app.args.always_control, term_size()) == Mode::Control
+    {
+        app.switch_mode(Mode::Control);
+    } else if app.args.always_control && app.mode == Mode::Observe {
+        // F3: otherwise the pane is inert with no explanation
+        app.hint("read-only until this pane is sized — type to take control");
+    }
 
     loop {
         // earliest pending deadline: mode-switch gap, reconnect, hint clear, idle release
@@ -926,6 +983,14 @@ pub async fn run(args: Args) -> Result<()> {
             }
             _ = sigwinch.recv() => {
                 app.renderer.invalidate();
+                // a resize means a client is laying this pane out, so the size is
+                // now a real viewport: take control if that is what we're for.
+                // control_sticky means control was refused twice in a row and we
+                // told the user "type to retry" — a window drag must not turn
+                // that into a reconnect storm.
+                if app.args.always_control && app.mode == Mode::Observe && !app.control_sticky {
+                    app.switch_mode(Mode::Control);
+                }
                 if app.mode == Mode::Control {
                     let (cols, rows) = term_size();
                     app.send(json!({ "type": "terminal.resize", "cols": cols, "rows": rows })).await;
@@ -1047,5 +1112,51 @@ mod tests {
         assert!(a.size_fixed);
         assert!(parse_args(&["onlyone".to_string()]).is_err());
         assert!(parse_args(&["a".into(), "b".into(), "--visibility-file".into(), "x".into()]).is_err());
+    }
+
+    // --- birth size trust (#23) ---
+    //
+    // herdr renders at 80x24 when no client is attached, and chrome only
+    // subtracts, so anything larger in either axis is provably a real viewport.
+
+    #[test]
+    fn a_placeholder_sized_pane_is_never_trusted() {
+        // what a mirror pane is born as when nobody is watching: 80x24 less a
+        // 26-col sidebar and the tab bar
+        assert!(!size_is_trusted((54, 23)));
+        // and the extremes of that layout, in case chrome is configured away
+        assert!(!size_is_trusted((80, 24)));
+        assert!(!size_is_trusted((80, 23)));
+    }
+
+    #[test]
+    fn an_ordinary_viewport_is_trusted_immediately() {
+        assert!(size_is_trusted((141, 44)));
+        assert!(size_is_trusted((133, 47)));
+        // one axis is enough: a tall narrow pane cannot come from a 24-row floor
+        assert!(size_is_trusted((60, 40)));
+        assert!(size_is_trusted((200, 20)));
+    }
+
+    #[test]
+    fn initial_mode_is_read_only_unless_the_size_vouches_for_itself() {
+        // the whole composition: only a trusted size under always_control opens
+        // writable, because Control is what can resize the remote
+        assert_eq!(initial_mode(true, (141, 44)), Mode::Control);
+        assert_eq!(initial_mode(true, (54, 23)), Mode::Observe, "placeholder-sized");
+        // without always_control we start read-only regardless, as before
+        assert_eq!(initial_mode(false, (141, 44)), Mode::Observe);
+        assert_eq!(initial_mode(false, (54, 23)), Mode::Observe);
+    }
+
+    #[test]
+    fn a_small_client_is_not_trusted_at_birth_and_must_earn_control() {
+        // A phone (45x18 -> pane 44x16) and moshi (50x25 -> 49x23) are real
+        // viewports, but at birth they are indistinguishable from the placeholder
+        // — that is the whole reason shape matching failed. They start read-only
+        // and the first resize or keystroke promotes them, rather than being
+        // allowed to impose a size we cannot vouch for.
+        assert!(!size_is_trusted((44, 16)));
+        assert!(!size_is_trusted((49, 23)));
     }
 }
