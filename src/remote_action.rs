@@ -36,6 +36,8 @@
 // whichever end is chosen, so the plugin must be installed there; anything it
 // does to the remote layout mirrors back like any other remote change.
 
+use std::io::IsTerminal;
+
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -154,6 +156,37 @@ async fn local_split(env: &Env, ctx: &InvocationContext, direction: &str) -> Res
     Ok(())
 }
 
+/// Entry points for main. Run the action; on failure post a toast to the
+/// local herdr before propagating. Key-bound and plugin-action invocations
+/// have their output discarded, so without the toast a failed keypress is
+/// indistinguishable from a dead key. Interactive runs (stderr is a tty)
+/// already see the error and skip it. Best effort on every leg: a herdr
+/// without notification.show, or none reachable, changes nothing.
+pub async fn invoke_cmd(env: Env, spec: &str) -> Result<()> {
+    let what = format!("remote-invoke {spec}");
+    report_failure(&env, &what, invoke(&env, spec).await).await
+}
+
+pub async fn run_cmd(env: Env, kind: &str, direction: Option<&str>) -> Result<()> {
+    let what = format!("remote-{kind}");
+    report_failure(&env, &what, run(&env, kind, direction).await).await
+}
+
+async fn report_failure(env: &Env, what: &str, result: Result<()>) -> Result<()> {
+    let Err(e) = result else { return Ok(()) };
+    if !std::io::stderr().is_terminal() {
+        if let Ok(api) = crate::api::ApiClient::connect(&env.local_socket).await {
+            let _ = api
+                .request(
+                    "notification.show",
+                    json!({ "title": format!("mirror: {what} failed"), "body": e.to_string() }),
+                )
+                .await;
+        }
+    }
+    Err(e)
+}
+
 /// Context for the local-invoke fallback: the plugin-action JSON verbatim when
 /// present (full fidelity — cwd, tab, selection all pass through), else the
 /// `HERDR_ACTIVE_*` fields a shell binding gets.
@@ -182,7 +215,7 @@ fn local_context_value(ctx: &InvocationContext) -> Value {
 /// host, with the invocation context translated to the remote ids. Outside a
 /// mirror the action is invoked on the local herdr instead. A bare action id
 /// (no dot) is passed without a plugin_id for the server to resolve.
-pub async fn invoke(env: Env, spec: &str) -> Result<()> {
+async fn invoke(env: &Env, spec: &str) -> Result<()> {
     let (plugin_id, action_id) = match spec.split_once('.') {
         Some((p, a)) if !p.is_empty() && !a.is_empty() => (Some(p), a),
         Some(_) => return Err(err(format!("bad action spec {spec:?}: want <plugin>.<action>"))),
@@ -192,7 +225,7 @@ pub async fn invoke(env: Env, spec: &str) -> Result<()> {
     let ctx = invocation_context();
     // Same deliberate non-`?` as run(): the local fallback needs no host config.
     let config = load_config(&env.config_search);
-    let resolved = config.as_ref().ok().and_then(|c| resolve_context(&env, &c.hosts, &ctx));
+    let resolved = config.as_ref().ok().and_then(|c| resolve_context(env, &c.hosts, &ctx));
 
     let Some(resolved) = resolved else {
         let api = crate::api::ApiClient::connect(&env.local_socket).await?;
@@ -237,7 +270,7 @@ pub async fn invoke(env: Env, spec: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn run(env: Env, kind: &str, direction: Option<&str>) -> Result<()> {
+async fn run(env: &Env, kind: &str, direction: Option<&str>) -> Result<()> {
     if kind == "split" && !matches!(direction, Some("right") | Some("down")) {
         return Err(err("remote-split needs a direction: right|down"));
     }
@@ -249,7 +282,7 @@ pub async fn run(env: Env, kind: &str, direction: Option<&str>) -> Result<()> {
     // hosts.toml yet, with an error about SSH hosts they never asked for.
     let config = load_config(&env.config_search);
     let resolved =
-        config.as_ref().ok().and_then(|c| resolve_context(&env, &c.hosts, &ctx));
+        config.as_ref().ok().and_then(|c| resolve_context(env, &c.hosts, &ctx));
 
     // One key for both worlds: inside a mirror these take the remote path
     // below; anywhere else they degrade to the plain local action instead of
@@ -259,9 +292,9 @@ pub async fn run(env: Env, kind: &str, direction: Option<&str>) -> Result<()> {
     // daemon-owned workspace.
     if resolved.is_none() {
         match kind {
-            "tab" => return local_tab(&env, &ctx).await,
+            "tab" => return local_tab(env, &ctx).await,
             // direction was validated at the top of this fn
-            "split" => return local_split(&env, &ctx, direction.unwrap()).await,
+            "split" => return local_split(env, &ctx, direction.unwrap()).await,
             _ => {}
         }
     }
