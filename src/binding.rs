@@ -28,10 +28,65 @@ const CLI_PATH: &str = "~/.local/bin/herdr-mirror";
 const MARKER: &str = "# herdr-mirror bind:";
 
 fn herdr_config_path() -> PathBuf {
+    // same precedence herdr's own config_path() uses
+    if let Ok(p) = std::env::var("HERDR_CONFIG_PATH") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
     match std::env::var("XDG_CONFIG_HOME") {
         Ok(dir) if !dir.is_empty() => PathBuf::from(dir).join("herdr/config.toml"),
         _ => home_dir().join(".config/herdr/config.toml"),
     }
+}
+
+/// herdr constrains plugin/action ids to this charset at manifest load; a
+/// spec is such ids joined by dots. Enforcing it here keeps a hostile or
+/// mistyped spec out of the TOML string and out of the `sh -lc` line herdr
+/// executes on every keypress — `remote-actions` output is remote-supplied,
+/// and copy-pasting it into `bind` is the documented workflow.
+fn valid_spec(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '.' | '_' | '-'))
+}
+
+/// Key combos are alphanumeric segments joined by '+' (prefix+alt+l, f1,
+/// minus). Anything outside that can't be safely quoted into the TOML block,
+/// so it's refused rather than escaped.
+fn valid_key(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '_' | '-'))
+}
+
+/// Replace control characters before terminal output — remote-supplied titles
+/// must not be able to smuggle escape sequences into the user's terminal.
+fn printable(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
+}
+
+/// Is `key` already the value of some binding line? Covers `key = "<k>"` in
+/// [[keys.command]] AND named overrides like `new_tab = "<k>"`, both quote
+/// styles, ignoring comments. herdr's built-in defaults aren't in the file so
+/// they can't be detected — which is also the documented way to shadow a
+/// native key on purpose. (List-valued bindings are not scanned.)
+fn key_bound_in(content: &str, key: &str) -> bool {
+    let (dq, sq) = (format!("\"{key}\""), format!("'{key}'"));
+    content.lines().any(|l| {
+        let l = l.trim();
+        if l.starts_with('#') {
+            return false;
+        }
+        let Some((_, v)) = l.split_once('=') else { return false };
+        let v = v.split('#').next().unwrap_or("").trim();
+        v == dq || v == sq
+    })
+}
+
+/// Atomic replace: a crash mid-write must not truncate herdr's config.
+fn write_config(path: &PathBuf, content: &str) -> Result<()> {
+    let tmp = path.with_extension("toml.herdr-mirror-tmp");
+    fs::write(&tmp, content).map_err(|e| err(format!("cannot write {}: {e}", tmp.display())))?;
+    fs::rename(&tmp, path).map_err(|e| err(format!("cannot replace {}: {e}", path.display())))
 }
 
 fn binding_block(spec: &str, key: &str) -> String {
@@ -59,9 +114,15 @@ async fn list_actions(api: &crate::api::ApiClient) -> Result<Vec<(String, String
 }
 
 fn print_actions(rows: &[(String, String)]) {
-    let width = rows.iter().map(|(s, _)| s.len()).max().unwrap_or(0);
-    for (spec, title) in rows {
-        println!("  {spec:width$}  {title}");
+    // a spec outside herdr's id charset is either corruption or an attempt to
+    // get shell metacharacters copy-pasted into a binding — never print it
+    let (ok, bad): (Vec<_>, Vec<_>) = rows.iter().partition(|(s, _)| valid_spec(s));
+    let width = ok.iter().map(|(s, _)| s.len()).max().unwrap_or(0);
+    for (spec, title) in &ok {
+        println!("  {spec:width$}  {}", printable(title));
+    }
+    if !bad.is_empty() {
+        println!("  (skipped {} action(s) with non-standard ids)", bad.len());
     }
 }
 
@@ -126,8 +187,33 @@ pub async fn remote_actions(env: Env, host_arg: Option<&str>) -> Result<()> {
 /// in the file (a duplicate key would be ambiguous, and this tool only ever
 /// appends); a spec bound by us already is a no-op.
 pub async fn bind(env: Env, spec: &str, key: &str) -> Result<()> {
-    if matches!(spec.split_once('.'), Some((p, a)) if p.is_empty() || a.is_empty()) {
-        return Err(err(format!("bad action spec {spec:?}: want <plugin>.<action>")));
+    if !valid_spec(spec) || matches!(spec.split_once('.'), Some((p, a)) if p.is_empty() || a.is_empty())
+    {
+        return Err(err(format!(
+            "bad action spec {spec:?}: want <plugin>.<action> using only letters, digits, and :._-"
+        )));
+    }
+    if !valid_key(key) {
+        return Err(err(format!(
+            "bad key {key:?}: want segments joined by '+' using only letters, digits, and _-"
+        )));
+    }
+
+    // Connect (and probe the action) BEFORE touching the file: a down server
+    // aborts with nothing changed, and the read-check-write window that races
+    // herdr's own config writes stays as small as possible.
+    let api = crate::api::ApiClient::connect(&env.local_socket).await?;
+    match list_actions(&api).await {
+        Ok(rows) if !rows.iter().any(|(s, _)| s == spec) => {
+            println!("note: {spec} is not on the local herdr; assuming it exists on the remote");
+        }
+        _ => {}
+    }
+    if !crate::util::cli_link_path().exists() {
+        println!(
+            "warning: {} does not exist yet — the binding won't fire until it does (Mirror: start repairs it)",
+            crate::util::cli_link_path().display()
+        );
     }
 
     let path = herdr_config_path();
@@ -147,25 +233,15 @@ pub async fn bind(env: Env, spec: &str, key: &str) -> Result<()> {
         println!("{spec} is already bound by herdr-mirror in {}", path.display());
         return Ok(());
     }
-    if content.contains(&format!("key = \"{key}\"")) {
+    if key_bound_in(&content, key) {
         return Err(err(format!(
             "{key} is already bound in {}; pick another key or edit the file",
             path.display()
         )));
     }
 
-    // reload needs the socket anyway, so connect before writing anything
-    let api = crate::api::ApiClient::connect(&env.local_socket).await?;
-    match list_actions(&api).await {
-        Ok(rows) if !rows.iter().any(|(s, _)| s == spec) => {
-            println!("note: {spec} is not on the local herdr; assuming it exists on the remote");
-        }
-        _ => {}
-    }
-
     let block = binding_block(spec, key);
-    fs::write(&path, format!("{content}{block}"))
-        .map_err(|e| err(format!("cannot write {}: {e}", path.display())))?;
+    write_config(&path, &format!("{content}{block}"))?;
     println!("appended to {}:{block}", path.display());
 
     api.request("server.reload_config", json!({})).await?;
@@ -177,6 +253,10 @@ pub async fn bind(env: Env, spec: &str, key: &str) -> Result<()> {
 /// spec (marker line) or the key (its `key = "..."` line), plus the blank
 /// line the append added. Only marker-carrying blocks are candidates.
 pub async fn unbind(env: Env, what: &str) -> Result<()> {
+    // connect first, like bind: a down server must not leave the file edited
+    // but the running config stale
+    let api = crate::api::ApiClient::connect(&env.local_socket).await?;
+
     let path = herdr_config_path();
     let content = fs::read_to_string(&path)
         .map_err(|e| err(format!("cannot read {}: {e}", path.display())))?;
@@ -188,11 +268,17 @@ pub async fn unbind(env: Env, what: &str) -> Result<()> {
     while i < lines.len() {
         let line = lines[i];
         if let Some(spec) = line.trim().strip_prefix(MARKER) {
-            // our blocks are exactly marker + 4 lines (see binding_block)
+            // our blocks are exactly marker + 4 lines (see binding_block);
+            // verify the shape before touching anything so a hand-edited
+            // block or a marker-lookalike comment never loses a neighbor line
             let block = &lines[i..(i + 5).min(lines.len())];
-            let key_hit =
-                block.iter().any(|l| l.trim() == format!("key = \"{what}\""));
-            if spec.trim() == what || key_hit {
+            let is_our_block = block.len() == 5
+                && block[1].trim() == "[[keys.command]]"
+                && block[2].trim().starts_with("key = \"")
+                && block[3].trim() == "type = \"shell\""
+                && block[4].trim().starts_with(&format!("command = \"{CLI_PATH} remote-invoke "));
+            let key_hit = block.iter().any(|l| l.trim() == format!("key = \"{what}\""));
+            if is_our_block && (spec.trim() == what || key_hit) {
                 if out.ends_with("\n\n") {
                     out.pop(); // the blank separator the append added
                 }
@@ -208,13 +294,12 @@ pub async fn unbind(env: Env, what: &str) -> Result<()> {
 
     if removed == 0 {
         return Err(err(format!(
-            "no herdr-mirror-managed binding for {what:?} in {} (only blocks written by `herdr-mirror bind` are removable)",
+            "no herdr-mirror-managed binding for {what:?} in {} (only intact blocks written by `herdr-mirror bind` are removable)",
             path.display()
         )));
     }
-    fs::write(&path, out).map_err(|e| err(format!("cannot write {}: {e}", path.display())))?;
+    write_config(&path, &out)?;
 
-    let api = crate::api::ApiClient::connect(&env.local_socket).await?;
     api.request("server.reload_config", json!({})).await?;
     println!("reloaded herdr config");
     Ok(())
