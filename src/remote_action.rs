@@ -216,11 +216,15 @@ fn local_context_value(ctx: &InvocationContext) -> Value {
 /// mirror the action is invoked on the local herdr instead. A bare action id
 /// (no dot) is passed without a plugin_id for the server to resolve.
 async fn invoke(env: &Env, spec: &str) -> Result<()> {
-    let (plugin_id, action_id) = match spec.split_once('.') {
-        Some((p, a)) if !p.is_empty() && !a.is_empty() => (Some(p), a),
-        Some(_) => return Err(err(format!("bad action spec {spec:?}: want <plugin>.<action>"))),
-        None => (None, spec),
-    };
+    // The spec goes to the server verbatim as action_id: herdr matches it
+    // against bare action ids AND qualified <plugin>.<action> ids, and plugin
+    // ids may themselves contain dots (jt.command-palette), so any client-side
+    // split at a dot would pick the wrong plugin. Ambiguity is the server's
+    // call too — it errors asking for the qualified form.
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return Err(err("usage: herdr-mirror remote-invoke <plugin>.<action>"));
+    }
 
     let ctx = invocation_context();
     // Same deliberate non-`?` as run(): the local fallback needs no host config.
@@ -229,10 +233,7 @@ async fn invoke(env: &Env, spec: &str) -> Result<()> {
 
     let Some(resolved) = resolved else {
         let api = crate::api::ApiClient::connect(&env.local_socket).await?;
-        let mut params = json!({ "action_id": action_id, "context": local_context_value(&ctx) });
-        if let Some(p) = plugin_id {
-            params["plugin_id"] = json!(p);
-        }
+        let params = json!({ "action_id": spec, "context": local_context_value(&ctx) });
         api.request("plugin.action.invoke", params).await?;
         println!("invoked {spec} locally");
         return Ok(());
@@ -256,10 +257,7 @@ async fn invoke(env: &Env, spec: &str) -> Result<()> {
             }
         }
     }
-    let mut params = json!({ "action_id": action_id, "context": context });
-    if let Some(p) = plugin_id {
-        params["plugin_id"] = json!(p);
-    }
+    let params = json!({ "action_id": spec, "context": context });
     api.request("plugin.action.invoke", params).await.map_err(|e| {
         err(format!(
             "remote invoke {spec} on {}: {e} (needs the plugin installed there, and a herdr with plugin.action.invoke)",
