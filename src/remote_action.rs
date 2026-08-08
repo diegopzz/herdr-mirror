@@ -35,6 +35,9 @@
 // one-key-for-both-worlds degrade as remote-tab/split. The action runs on
 // whichever end is chosen, so the plugin must be installed there; anything it
 // does to the remote layout mirrors back like any other remote change.
+// Inside a mirror workspace it requires a MIRRORED focused pane, like
+// remote-split: the remote backfills omitted context from its own focused
+// pane, so an untranslated pane would target an arbitrary remote object.
 
 use std::io::IsTerminal;
 
@@ -238,6 +241,17 @@ async fn invoke(env: &Env, spec: &str) -> Result<()> {
         println!("invoked {spec} locally");
         return Ok(());
     };
+
+    // Same guard as remote-split, for a different reason: herdr backfills any
+    // context field the client omits from the REMOTE's currently active
+    // workspace, so invoking without a translated pane would hand the action
+    // whatever pane/cwd happens to be focused over there — possibly an
+    // unrelated project. Erroring beats silently acting on the wrong pane.
+    if resolved.remote_pane_id.is_none() {
+        return Err(err(format!(
+            "remote invoke {spec}: the focused pane is not a mirrored pane, so the remote would fall back to its own focused pane — focus a mirror pane and retry"
+        )));
+    }
 
     let mut remote = RemoteHost::new(&resolved.host, &env.state_dir);
     let (api, _status) = remote.connect_api().await?;
