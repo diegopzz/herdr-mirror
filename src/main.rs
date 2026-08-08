@@ -57,6 +57,11 @@ fn run_on(rt: &tokio::runtime::Runtime, cmd: &str, rest: &[String]) -> Result<()
         "start" => {
             let env = Env::resolve()?;
             daemon::set_paused(&env, false); // explicit start lifts a manual pause
+            // explicit start is also the sanctioned moment to repair the CLI
+            // link (the daemon and the ensure hook only ever report it broken)
+            if let Some(msg) = util::repair_cli_link() {
+                println!("{msg}");
+            }
             daemon::cmd_start(&env)
         }
         "pause" | "stop" => {

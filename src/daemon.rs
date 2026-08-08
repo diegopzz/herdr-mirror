@@ -525,6 +525,21 @@ pub async fn cmd_run(env: Env) -> Result<()> {
     }
 
     let local = ApiClient::connect(&env.local_socket).await?;
+    // Detect-and-report only: a broken CLI link means every keybinding through
+    // it dies silently, but the repair stays behind the explicit `start`
+    // command — the daemon never rewrites the filesystem in the background.
+    if let Some(problem) = crate::util::cli_link_problem() {
+        log.log(&format!("warning: {problem} — keybindings using it can't fire; run start to repair"));
+        let _ = local
+            .request(
+                "notification.show",
+                json!({
+                    "title": "mirror: CLI link broken",
+                    "body": format!("{problem} — run Mirror: start (or herdr-mirror start) to repair"),
+                }),
+            )
+            .await;
+    }
     let closes = crate::closes::new_closes();
     let mut pokers: Vec<mpsc::Sender<()>> = Vec::new();
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
@@ -668,6 +683,19 @@ pub fn cmd_status(env: &Env) -> Result<()> {
             "daemon: not running{}",
             if is_paused(env) { " (paused — resume with start)" } else { "" }
         ),
+    }
+    match crate::util::cli_link_state() {
+        crate::util::CliLink::Ok(t) => println!("cli link: ok (-> {})", t.display()),
+        crate::util::CliLink::Missing => {
+            println!("cli link: MISSING ({}) — keybindings using it can't fire; start repairs it", crate::util::cli_link_path().display())
+        }
+        crate::util::CliLink::Dangling(t) => {
+            println!("cli link: BROKEN (-> {}) — keybindings using it can't fire; start repairs it", t.display())
+        }
+        crate::util::CliLink::Other(t) => println!("cli link: -> {} (not this binary; left alone)", t.display()),
+        crate::util::CliLink::File => {
+            println!("cli link: {} is a regular file (not managed)", crate::util::cli_link_path().display())
+        }
     }
     let config = load_config(&env.config_search)?;
     if let Some(src) = &config.source {

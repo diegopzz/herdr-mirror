@@ -62,6 +62,71 @@ pub fn default_config_dir() -> PathBuf {
     home_dir().join(".config").join("herdr-mirror")
 }
 
+/// The stable CLI path install.sh links and the README's keybindings use.
+pub fn cli_link_path() -> PathBuf {
+    home_dir().join(".local").join("bin").join("herdr-mirror")
+}
+
+pub enum CliLink {
+    /// resolves to the running binary
+    Ok(PathBuf),
+    /// nothing at the path
+    Missing,
+    /// a symlink whose target no longer exists
+    Dangling(PathBuf),
+    /// a live symlink to some other binary — a deliberate arrangement
+    Other(PathBuf),
+    /// a regular file we don't manage
+    File,
+}
+
+pub fn cli_link_state() -> CliLink {
+    let link = cli_link_path();
+    match fs::read_link(&link) {
+        // read_link fails for both "missing" and "not a symlink"
+        Err(_) if !link.exists() => CliLink::Missing,
+        Err(_) => CliLink::File,
+        Ok(target) => {
+            let resolved = fs::canonicalize(&link).ok();
+            let exe = std::env::current_exe().ok().and_then(|e| fs::canonicalize(e).ok());
+            match resolved {
+                None => CliLink::Dangling(target),
+                Some(r) if exe.as_ref() == Some(&r) => CliLink::Ok(target),
+                Some(_) => CliLink::Other(target),
+            }
+        }
+    }
+}
+
+/// The states worth interrupting the user about: keybindings through the link
+/// cannot fire at all. `Other`/`File` are deliberate arrangements, not
+/// breakage, so they never warn — `status` still shows them.
+pub fn cli_link_problem() -> Option<String> {
+    match cli_link_state() {
+        CliLink::Missing => Some(format!("{} is missing", cli_link_path().display())),
+        CliLink::Dangling(t) => {
+            Some(format!("{} dangles (-> {})", cli_link_path().display(), t.display()))
+        }
+        _ => None,
+    }
+}
+
+/// Repair a missing/dangling link by pointing it at the running binary.
+/// Reserved for the explicit `start` command — the daemon only reports (see
+/// cli_link_problem), so nothing rewrites the filesystem in the background.
+/// A live foreign link or real file is never replaced.
+pub fn repair_cli_link() -> Option<String> {
+    cli_link_problem()?;
+    let link = cli_link_path();
+    let exe = std::env::current_exe().ok()?;
+    let _ = fs::create_dir_all(link.parent()?);
+    let _ = fs::remove_file(&link);
+    Some(match std::os::unix::fs::symlink(&exe, &link) {
+        Ok(()) => format!("relinked {} -> {}", link.display(), exe.display()),
+        Err(e) => format!("could not relink {}: {e}", link.display()),
+    })
+}
+
 /// Config dirs to search, most specific first.
 ///
 /// Order matters more than it looks. herdr injects `HERDR_PLUGIN_CONFIG_DIR`
