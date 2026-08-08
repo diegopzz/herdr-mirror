@@ -63,3 +63,33 @@ EXPECTED="$(grep " ${ASSET}\$" "${TMP}/SHA256SUMS")" ||
 mkdir -p "$(dirname "$DEST")"
 install -m 755 "${TMP}/${ASSET}" "$DEST"
 echo "installed ${ASSET} v${VERSION} at ${DEST}"
+
+# Link the CLI at the stable path the README documents. Keybindings must use
+# the absolute ~/.local/bin/herdr-mirror (herdr runs shell bindings through a
+# login sh that never reads ~/.zshrc, so PATH can't be trusted there), and
+# `herdr-mirror <cmd>` should work from a shell. Refreshed on every update;
+# anything at that path we don't manage is left alone.
+LINK="${HOME}/.local/bin/herdr-mirror"
+TARGET="$(pwd)/${DEST}"
+
+# A link is foreign when it's live, isn't our target, and points outside
+# herdr's plugin dirs — e.g. a dev checkout the user linked deliberately.
+is_foreign_link() {
+  [ -L "$LINK" ] && [ -e "$LINK" ] || return 1
+  CUR="$(readlink "$LINK")"
+  [ "$CUR" = "$TARGET" ] && return 1
+  case "$CUR" in
+    "${HOME}/.config/herdr/plugins/"*) return 1 ;; # an older install of ours
+  esac
+  return 0
+}
+
+if [ -e "$LINK" ] && [ ! -L "$LINK" ]; then
+  echo "note: ${LINK} exists and is not a symlink; left untouched (README keybindings expect herdr-mirror there)"
+elif is_foreign_link; then
+  echo "note: ${LINK} -> ${CUR} left untouched; not managed by this install"
+else
+  mkdir -p "${HOME}/.local/bin"
+  ln -sf "$TARGET" "$LINK"
+  echo "linked ${LINK} -> ${TARGET}"
+fi
