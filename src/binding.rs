@@ -127,17 +127,10 @@ fn print_actions(rows: &[(String, String)]) {
 }
 
 /// `remote-actions [host]`: what `remote-invoke` can reach. No argument lists
-/// the local herdr and every configured host; a host name narrows to that
-/// host ("local" is accepted for the local herdr). Unreachable hosts report
-/// and don't abort the rest of the listing.
+/// every configured host, then the local herdr last — the remote side is the
+/// part you can't see from here, so it leads. A host name (or "local")
+/// narrows to that one. Unreachable hosts report and don't abort the rest.
 pub async fn remote_actions(env: Env, host_arg: Option<&str>) -> Result<()> {
-    let show_local = matches!(host_arg, None | Some("local"));
-    if show_local {
-        println!("local:");
-        let api = crate::api::ApiClient::connect(&env.local_socket).await?;
-        print_actions(&list_actions(&api).await?);
-    }
-
     if host_arg != Some("local") {
         // remote-actions is a discovery command, so unlike remote-invoke a
         // missing/broken hosts.toml only matters when hosts were asked for
@@ -162,16 +155,27 @@ pub async fn remote_actions(env: Env, host_arg: Option<&str>) -> Result<()> {
             if host_arg.is_some_and(|name| name != host.name) {
                 continue;
             }
-            println!("{}:", host.name);
+            // an ssh connect can take seconds; say so instead of hanging mute
+            println!("connecting to {}...", host.name);
             let mut remote = RemoteHost::new(host, &env.state_dir);
             match remote.connect_api().await {
                 Ok((api, _)) => match list_actions(&api).await {
-                    Ok(rows) => print_actions(&rows),
-                    Err(e) => println!("  (cannot list: {e})"),
+                    Ok(rows) => {
+                        println!("{}:", host.name);
+                        print_actions(&rows);
+                    }
+                    Err(e) => println!("{}: (cannot list: {e})", host.name),
                 },
-                Err(e) => println!("  (unreachable: {e})"),
+                Err(e) => println!("{}: (unreachable: {e})", host.name),
             }
+            println!();
         }
+    }
+
+    if matches!(host_arg, None | Some("local")) {
+        println!("local:");
+        let api = crate::api::ApiClient::connect(&env.local_socket).await?;
+        print_actions(&list_actions(&api).await?);
     }
 
     println!();
