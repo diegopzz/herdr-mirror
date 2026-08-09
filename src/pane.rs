@@ -205,8 +205,9 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
         .as_ref()
         .map(|s| format!(" --session {}", sh_quote(s)))
         .unwrap_or_default();
-    // Configured paths stay unquoted so remote-shell ~ expands; auto mode is a
-    // command-substitution expression (see config::remote_bin_expr).
+    // Configured paths stay unquoted so remote-shell ~ expands; auto mode is an
+    // `sh -c` resolver that takes the trailing words as "$@" (see
+    // config::remote_bin_expr).
     let bin = crate::config::remote_bin_expr(args.remote_bin.as_deref());
     let cmd = format!(
         "exec {}{} terminal session {} {} --cols {} --rows {}",

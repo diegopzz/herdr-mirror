@@ -10,15 +10,20 @@ use crate::util::{err, Result};
 /// Shell expression for `exec <expr> ...` on the remote.
 ///
 /// A configured path is used as-is (unquoted so remote-shell `~` expands).
-/// When unset, the remote shell resolves `herdr` via PATH, falling back to
-/// `~/.local/bin/herdr` if `command -v` finds nothing. The auto form is
-/// double-quoted so a path with spaces (PATH entry or `$HOME`) stays one word.
+/// When unset, `herdr` is resolved via PATH, falling back to
+/// `~/.local/bin/herdr` if `command -v` finds nothing.
 pub fn remote_bin_expr(remote_bin: Option<&str>) -> String {
     match remote_bin {
         Some(b) if !b.is_empty() => b.to_string(),
-        // Quotes around the substitution prevent word-splitting if the resolved
-        // path contains spaces; ~ still expands inside the unquoted `echo` arg.
-        _ => "env \"$(command -v herdr 2>/dev/null || echo ~/.local/bin/herdr)\"".into(),
+        // The `$(...)` substitution must run under a POSIX sh, never the remote
+        // login shell: `ssh host cmd` hands the string to that shell, and fish
+        // rejects `$(...)` (in command position always; everywhere before fish
+        // 3.4), as does csh. The login shell only has to parse `sh -c
+        // '<literal>' herdr` plus the caller's trailing words, which every
+        // shell handles alike; the args land in `"$@"`. Quotes around the
+        // substitution prevent word-splitting if the resolved path contains
+        // spaces; ~ still expands inside the unquoted `echo` arg.
+        _ => "sh -c 'exec \"$(command -v herdr 2>/dev/null || echo ~/.local/bin/herdr)\" \"$@\"' herdr".into(),
     }
 }
 
@@ -388,14 +393,9 @@ mod tests {
     fn remote_bin_expr_configured_vs_auto() {
         assert_eq!(remote_bin_expr(Some("/opt/herdr")), "/opt/herdr");
         assert_eq!(remote_bin_expr(Some("~/.local/bin/herdr")), "~/.local/bin/herdr");
-        assert_eq!(
-            remote_bin_expr(None),
-            "env \"$(command -v herdr 2>/dev/null || echo ~/.local/bin/herdr)\""
-        );
-        assert_eq!(
-            remote_bin_expr(Some("")),
-            "env \"$(command -v herdr 2>/dev/null || echo ~/.local/bin/herdr)\""
-        );
+        let auto = "sh -c 'exec \"$(command -v herdr 2>/dev/null || echo ~/.local/bin/herdr)\" \"$@\"' herdr";
+        assert_eq!(remote_bin_expr(None), auto);
+        assert_eq!(remote_bin_expr(Some("")), auto);
     }
 
     #[test]
