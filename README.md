@@ -42,6 +42,10 @@ herdr plugin install nikok6/herdr-mirror     # or: herdr plugin link <path>
 herdr server reload-config                   # load the plugin (actions + autostart hook)
 ```
 
+Installing also links the CLI at `~/.local/bin/herdr-mirror`, so `herdr-mirror
+<cmd>` works from a shell and keybindings get one stable path that survives
+updates.
+
 Then create the config at `~/.config/herdr-mirror/hosts.toml`:
 
 ```toml
@@ -99,6 +103,14 @@ mirrors back within seconds.
 action instead of erroring, so one binding can replace the native key entirely.
 Exception: on a non-mirrored pane inside a mirror workspace, `remote-split-*`
 errors rather than splitting locally, which would desync the mirrored layout.
+
+**Invoke any remote plugin** — locally bound keys never reach a mirror pane's
+stdin, so remote plugins can't be driven by their own bindings. `remote-invoke
+<plugin>.<action>` runs the action on the mirrored host behind your focused
+pane, handing it the remote workspace, pane, and cwd; outside a mirror it runs
+the action locally, so one key covers both worlds. The plugin must be
+installed on whichever end runs it. See
+[Remote plugin keys](#remote-plugin-keys) for binding it.
 
 **Continuous streaming** — every mirror pane streams its remote pane live for
 its whole lifetime, each over its own connection, so panes are never
@@ -189,6 +201,40 @@ command = "mirror.remote-split-down"
 
 The tradeoff: those keys now depend on this plugin being installed and enabled,
 since the native binding no longer covers them.
+
+### Remote plugin keys
+
+`remote-invoke` takes the action to forward as an argument, which plugin
+actions can't carry, so bind it as a `shell` command. Use the absolute
+`~/.local/bin/herdr-mirror` path the install linked: herdr runs shell bindings
+through a login `sh` that never reads `~/.zshrc`, so a bare `herdr-mirror`
+works or silently fails depending on how herdr was launched, while the
+absolute path works everywhere.
+
+```toml
+[[keys.command]]
+key = "prefix+alt+l"
+type = "shell"
+command = "~/.local/bin/herdr-mirror remote-invoke lazygit.open"
+```
+
+One binding covers every machine: the action fires on the focused mirror's
+host, or locally outside a mirror. When it can't fire (plugin not installed
+there, typo, unreachable host, non-mirrored pane), a toast tells you why —
+key-bound output is discarded, so the toast is the feedback channel.
+
+Or skip the hand-editing entirely:
+
+```bash
+herdr-mirror remote-actions                  # list what each host + local can invoke
+herdr-mirror bind lazygit.open prefix+alt+l  # write the block above + reload herdr
+herdr-mirror unbind lazygit.open             # remove it again (or: unbind <key>)
+```
+
+`bind` writes the marked block to `~/.config/herdr/config.toml`, refuses keys
+the file already binds, and reloads herdr, so the key is live immediately;
+`unbind` removes only blocks that `bind` wrote. `remote-actions` also prints a
+paste-ready binding block.
 
 ### Mouse
 
