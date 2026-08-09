@@ -872,7 +872,31 @@ impl App {
 // ---------------------------------------------------------------------------
 // main
 
+/// Removes the streamer pidfile on any exit path out of `run` (stale files
+/// from a hard kill are harmless — the daemon checks the pid is alive).
+struct PidfileGuard(std::path::PathBuf);
+impl Drop for PidfileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 pub async fn run(args: Args) -> Result<()> {
+    // announce ourselves so the daemon can tell its typed `exec` took
+    // (see util::streamer_pid_path); --dump is a human diagnostic, not a
+    // daemon-spawned streamer, so it must not claim the slot
+    let _pidfile = (!args.dump).then(|| {
+        let state_dir =
+            crate::util::home_dir().join(".local").join("state").join("herdr-mirror");
+        let path =
+            crate::util::streamer_pid_path(&state_dir, &args.ssh_target, &args.pane_target);
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&path, std::process::id().to_string());
+        PidfileGuard(path)
+    });
+
     let tty = !args.dump && unsafe { libc::isatty(libc::STDOUT_FILENO) } == 1;
     let raw = if tty {
         // 1002/1006: button-event mouse tracking with SGR encoding, so wheel and

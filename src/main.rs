@@ -57,6 +57,11 @@ fn run_on(rt: &tokio::runtime::Runtime, cmd: &str, rest: &[String]) -> Result<()
         "start" => {
             let env = Env::resolve()?;
             daemon::set_paused(&env, false); // explicit start lifts a manual pause
+            // explicit start is also the sanctioned moment to repair the CLI
+            // link (the daemon and the ensure hook only ever report it broken)
+            if let Some(msg) = util::repair_cli_link() {
+                println!("{msg}");
+            }
             daemon::cmd_start(&env)
         }
         "pause" | "stop" => {
@@ -80,9 +85,9 @@ fn run_on(rt: &tokio::runtime::Runtime, cmd: &str, rest: &[String]) -> Result<()
             let args = pane::parse_args(&rest[1..])?;
             rt.block_on(pane::run(args))
         }
-        "remote-workspace" => rt.block_on(remote_action::run(Env::resolve()?, "workspace", None)),
-        "remote-tab" => rt.block_on(remote_action::run(Env::resolve()?, "tab", None)),
-        "remote-split" => rt.block_on(remote_action::run(
+        "remote-workspace" => rt.block_on(remote_action::run_cmd(Env::resolve()?, "workspace", None)),
+        "remote-tab" => rt.block_on(remote_action::run_cmd(Env::resolve()?, "tab", None)),
+        "remote-split" => rt.block_on(remote_action::run_cmd(
             Env::resolve()?,
             "split",
             rest.get(1).map(String::as_str),
@@ -91,7 +96,7 @@ fn run_on(rt: &tokio::runtime::Runtime, cmd: &str, rest: &[String]) -> Result<()
             let spec = rest
                 .get(1)
                 .ok_or_else(|| util::err("usage: herdr-mirror remote-invoke <plugin>.<action>"))?;
-            rt.block_on(remote_action::invoke(Env::resolve()?, spec))
+            rt.block_on(remote_action::invoke_cmd(Env::resolve()?, spec))
         }
         other => Err(util::err(format!(
             "unknown command: {other} (daemon|pane|start|pause|ensure|status|once|restore|teardown|remote-workspace|remote-tab|remote-split|remote-invoke)"

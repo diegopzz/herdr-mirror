@@ -63,3 +63,74 @@ EXPECTED="$(grep " ${ASSET}\$" "${TMP}/SHA256SUMS")" ||
 mkdir -p "$(dirname "$DEST")"
 install -m 755 "${TMP}/${ASSET}" "$DEST"
 echo "installed ${ASSET} v${VERSION} at ${DEST}"
+
+# Link the CLI at the stable path the README documents. Keybindings must use
+# the absolute ~/.local/bin/herdr-mirror (herdr runs shell bindings through a
+# login sh that never reads ~/.zshrc, so PATH can't be trusted there), and
+# `herdr-mirror <cmd>` should work from a shell. Refreshed on every update;
+# a live file or link we don't manage is left alone.
+#
+# The link must NOT target pwd: herdr runs this build in
+# <plugins>/.tmp-install-*/checkout and only afterwards renames the checkout
+# to <plugins>/github/<id>-<hash>, deleting the temp dir — a link to pwd
+# dangles the moment the install succeeds. Derive that final path instead
+# (<hash> = first 12 hex chars of sha256(<id>), herdr's managed-path scheme;
+# the link briefly dangles until herdr's rename lands, which is fine). Run by
+# hand in a dev checkout (no .tmp-* ancestor under a plugins dir) it links
+# the checkout itself. `herdr-mirror status` reports link health, and the
+# daemon toasts if it ever goes stale, so a future herdr layout change is
+# loud, not a silent dead key.
+sha256_hex() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | cut -d' ' -f1
+  else
+    shasum -a 256 | cut -d' ' -f1
+  fi
+}
+final_bin_path() {
+  dir="$(pwd)"
+  while [ "$dir" != "/" ]; do
+    case "$(basename "$dir")" in
+      .tmp-*)
+        if [ "$(basename "$(dirname "$dir")")" = "plugins" ]; then
+          ID="$(sed -n 's/^id = "\(.*\)"/\1/p' herdr-plugin.toml | head -1)"
+          HASH="$(printf %s "$ID" | sha256_hex | cut -c1-12)"
+          echo "$(dirname "$dir")/github/${ID}-${HASH}/${DEST}"
+          return 0
+        fi
+        ;;
+    esac
+    dir="$(dirname "$dir")"
+  done
+  echo "$(pwd)/${DEST}"
+}
+LINK="${HOME}/.local/bin/herdr-mirror"
+TARGET="$(final_bin_path)"
+
+# A link is foreign when it's live, isn't our target, and points outside a
+# herdr plugins dir — e.g. a dev checkout the user linked deliberately.
+# A dangling link is never foreign: whatever it was, it's broken, and
+# replacing it is what makes the documented keybindings work again.
+is_foreign_link() {
+  [ -L "$LINK" ] && [ -e "$LINK" ] || return 1
+  CUR="$(readlink "$LINK")"
+  [ "$CUR" = "$TARGET" ] && return 1
+  case "$CUR" in
+    */herdr/plugins/* | */herdr-dev/plugins/*) return 1 ;; # an older install of ours
+  esac
+  return 0
+}
+
+if [ -e "$LINK" ] && [ ! -L "$LINK" ]; then
+  echo "note: ${LINK} exists and is not a symlink; left untouched (README keybindings expect herdr-mirror there)"
+elif is_foreign_link; then
+  echo "note: ${LINK} -> ${CUR} left untouched; not managed by this install"
+else
+  # linking is best-effort: the binary is already installed, so a failure here
+  # (say, an unwritable ~/.local/bin) must not fail the whole plugin install
+  if mkdir -p "${HOME}/.local/bin" && rm -f "$LINK" && ln -s "$TARGET" "$LINK"; then
+    echo "linked ${LINK} -> ${TARGET}"
+  else
+    echo "note: could not link ${LINK}; run the plugin's Mirror: start action to repair it"
+  fi
+fi
