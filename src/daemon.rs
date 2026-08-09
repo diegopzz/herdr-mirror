@@ -433,7 +433,7 @@ async fn heal_zombie_mirrors(
         let cmd_for = crate::mirror::cmd_for_pane(h, state_dir, &HashMap::new());
         for (remote_pane_id, local_pane_id) in dead {
             let argv = cmd_for(&remote_pane_id);
-            crate::mirror::spawn_streamer_pane(local, &local_pane_id, &argv, log).await;
+            crate::mirror::spawn_streamer_pane(local, state_dir, &local_pane_id, &argv, log).await;
         }
         let _ = pokers[i].try_send(());
     }

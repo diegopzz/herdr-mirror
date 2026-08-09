@@ -553,7 +553,13 @@ async fn split_mirror_pane(
 /// layout `command`), which set `launch_argv` and would surface every mirror pane
 /// as an agent row; a shell `exec` keeps it non-agent until a real agent is
 /// reported onto it.
-pub(crate) async fn spawn_streamer_pane(local: &ApiClient, local_pane_id: &str, argv: &[String], log: &Logger) {
+pub(crate) async fn spawn_streamer_pane(
+    local: &ApiClient,
+    state_dir: &std::path::Path,
+    local_pane_id: &str,
+    argv: &[String],
+    log: &Logger,
+) {
     let line = format!(
         "exec {}\n",
         argv.iter().map(|a| sh_quote(a)).collect::<Vec<_>>().join(" ")
@@ -563,7 +569,46 @@ pub(crate) async fn spawn_streamer_pane(local: &ApiClient, local_pane_id: &str, 
         .await
     {
         log.log(&format!("spawn streamer {local_pane_id}: {e}"));
+        return;
     }
+
+    // Typed input can be eaten by interactive shell startup (oh-my-zsh's
+    // update prompt swallows the first key — in EVERY new shell until it's
+    // answered). Verify the streamer registered its pidfile and retype the
+    // exec if not, off-loop so a slow shell never stalls reconcile. The
+    // alive-check right before each resend keeps a late-starting streamer
+    // from getting the line typed into its stdin (which would forward it to
+    // the remote pane as text).
+    let (Some(ssh_target), Some(pane_target)) = (argv.get(2).cloned(), argv.get(3).cloned())
+    else {
+        return;
+    };
+    let (local, log, state_dir) = (local.clone(), log.clone(), state_dir.to_path_buf());
+    let pane_id = local_pane_id.to_string();
+    tokio::spawn(async move {
+        for wait_ms in [3000u64, 4000] {
+            tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+            if crate::util::streamer_alive(&state_dir, &ssh_target, &pane_target) {
+                return;
+            }
+            log.log(&format!(
+                "streamer for {pane_target} not up in {pane_id} — shell startup likely ate the exec; retyping"
+            ));
+            if local
+                .request("pane.send_text", json!({ "pane_id": pane_id, "text": line }))
+                .await
+                .is_err()
+            {
+                return; // pane gone (closed meanwhile) — nothing to heal
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(4000)).await;
+        if !crate::util::streamer_alive(&state_dir, &ssh_target, &pane_target) {
+            log.log(&format!(
+                "streamer for {pane_target} still not up in {pane_id} after retries — pane left as a shell"
+            ));
+        }
+    });
 }
 
 /// cwd every mirror pane runs in, doubling as the loop-guard marker: it's set at
@@ -979,7 +1024,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                         PaneEntry { local_id: local_id.clone(), tombstone: None, seq, reported: None },
                     );
                     // plain pane created above; exec the streamer into it
-                    spawn_streamer_pane(&deps.local, &local_id, &cmd_for(rid), &deps.log).await;
+                    spawn_streamer_pane(&deps.local, &deps.state_dir, &local_id, &cmd_for(rid), &deps.log).await;
                 }
             } else {
                 // tab exists — add mirrors for individual new remote panes as
@@ -1034,7 +1079,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                             )
                             .await;
                     }
-                    spawn_streamer_pane(&deps.local, &local_id, &cmd_for(&place.pane), &deps.log)
+                    spawn_streamer_pane(&deps.local, &deps.state_dir, &local_id, &cmd_for(&place.pane), &deps.log)
                         .await;
                     state.panes.insert(
                         place.pane.clone(),
@@ -1069,7 +1114,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                     ));
                     let local_id =
                         split_mirror_pane(&deps.local, &target, &direction, None, &cwd).await?;
-                    spawn_streamer_pane(&deps.local, &local_id, &cmd_for(&rp.pane_id), &deps.log)
+                    spawn_streamer_pane(&deps.local, &deps.state_dir, &local_id, &cmd_for(&rp.pane_id), &deps.log)
                         .await;
                     state.panes.insert(
                         rp.pane_id.clone(),
