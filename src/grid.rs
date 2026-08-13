@@ -194,12 +194,25 @@ fn parse_osc(chars: &[char]) -> Option<usize> {
 ///
 /// Returns None when `seq` is some other OSC, `Some(None)` for the closing
 /// form (empty URI), and `Some(Some(uri))` to open a link.
+///
+/// Distrusts the stream like the rest of this file. Past the `8;` prefix the
+/// sequence IS a hyperlink, so anything malformed after it closes rather than
+/// being ignored: ignoring would leave the previous link open and silently
+/// attach it to every cell painted afterwards, which points a click at a URL
+/// the text never mentioned. Control characters are stripped from the URI for
+/// the same reason herdr strips them before sending (`sanitized_hyperlink_uri`)
+/// — it is re-emitted into the local terminal, where a control byte inside an
+/// OSC ends the string early and the tail executes. Deliberately no length cap:
+/// herdr has none, and truncating a URL yields a *different* valid one, which
+/// is the wrong-target failure this whole path exists to avoid.
 fn parse_osc8(seq: &[char]) -> Option<Option<Rc<str>>> {
     let body: String = seq.iter().collect();
     let body = body.strip_prefix("\x1b]")?;
     let body = body.strip_suffix('\x07').or_else(|| body.strip_suffix("\x1b\\"))?;
-    let (_params, uri) = body.strip_prefix("8;")?.split_once(';')?;
-    Some((!uri.is_empty()).then(|| Rc::from(uri)))
+    let rest = body.strip_prefix("8;")?;
+    let uri = rest.split_once(';').map_or("", |(_params, uri)| uri);
+    let uri: String = uri.chars().filter(|ch| !ch.is_control()).collect();
+    Some((!uri.is_empty()).then(|| Rc::from(uri.as_str())))
 }
 
 // ---------------------------------------------------------------------------
@@ -514,5 +527,51 @@ mod tests {
         let row2 = out.split("\x1b[2;1H").nth(1).expect("row 2 painted");
         assert!(!row2.contains("\x1b]8;;https"), "link leaked into row 2: {out:?}");
         assert_eq!(out.matches(UNLINK).count(), 1, "expected exactly one close: {out:?}");
+    }
+
+    #[test]
+    fn malformed_osc8_closes_instead_of_bleeding() {
+        // `8;` with no second `;` is not a link we can resolve. Treating it as
+        // "not an OSC 8" would leave the open link riding every later cell, so
+        // a click on unrelated text would open a URL the text never showed.
+        let mut g = Grid::new();
+        g.resize(4, 1);
+        g.apply(&format!("\x1b[1;1H{LINK}ab\x1b]8;\x1b\\cd"));
+        assert_eq!(g.rows[0][0].as_ref().unwrap().link.as_deref(), Some("https://example.com/x"));
+        assert_eq!(g.rows[0][2].as_ref().unwrap().link, None, "stale link bled past the malformed close");
+        assert_eq!(g.rows[0][3].as_ref().unwrap().link, None);
+    }
+
+    #[test]
+    fn osc8_uri_control_bytes_are_stripped() {
+        // the URI is re-emitted into the local terminal: a control byte inside
+        // an OSC ends the string there and the tail is executed, so a hostile
+        // remote could drive the terminal. herdr strips these too.
+        let mut g = Grid::new();
+        g.resize(4, 1);
+        g.apply("\x1b[1;1H\x1b]8;;https://e.com/\r\n\x0ex\x1b\\hi");
+        assert_eq!(g.rows[0][0].as_ref().unwrap().link.as_deref(), Some("https://e.com/x"));
+        let out = Renderer::new().paint(&g, 4, 1);
+        assert!(!out.contains('\r') && !out.contains('\x0e'), "control byte re-emitted: {out:?}");
+
+        // nothing left after filtering is a close, not a link to ""
+        let mut g = Grid::new();
+        g.resize(4, 1);
+        g.apply("\x1b[1;1H\x1b]8;;\r\n\x1b\\hi");
+        assert_eq!(g.rows[0][0].as_ref().unwrap().link, None);
+    }
+
+    #[test]
+    fn wrapped_link_reopens_on_the_continuation_row() {
+        // rows are painted from their own CUP, so a link spanning a wrap must
+        // be re-opened on the next row or only its first half stays clickable
+        let mut g = Grid::new();
+        g.resize(2, 2);
+        g.apply(&format!("\x1b[1;1H{LINK}ab\x1b[2;1Hcd{UNLINK}"));
+        let out = Renderer::new().paint(&g, 2, 2);
+        let row2 = out.split("\x1b[2;1H").nth(1).expect("row 2 painted");
+        assert!(row2.contains(LINK), "continuation row lost the link: {out:?}");
+        assert_eq!(out.matches(LINK).count(), 2, "expected one open per row: {out:?}");
+        assert_eq!(out.matches(UNLINK).count(), 2, "expected one close per row: {out:?}");
     }
 }
