@@ -355,6 +355,8 @@ pub(crate) fn cmd_for_pane(
     let target = host.target.clone();
     let remote_bin = host.remote_bin.clone();
     let always_control = host.always_control;
+    let max_cols = host.max_cols;
+    let max_rows = host.max_rows;
     let kind = host.kind.clone();
     let docker_bin = host.docker_bin.clone();
     // daemon's ControlMaster socket for this host (see remote.rs); the streamer
@@ -375,6 +377,13 @@ pub(crate) fn cmd_for_pane(
         }
         if always_control {
             argv.push("--always-control".into());
+        }
+        // absent when uncapped, so the argv of an unconfigured host is unchanged
+        if let Some(c) = max_cols {
+            argv.extend(["--max-cols".into(), c.to_string()]);
+        }
+        if let Some(r) = max_rows {
+            argv.extend(["--max-rows".into(), r.to_string()]);
         }
         // ssh only: the pane reuses the daemon's ControlMaster for cheap
         // foreground polls. Docker has no ControlMaster, and healing no longer
@@ -1510,6 +1519,8 @@ mod tests {
             prefix: "vps".into(),
             remote_bin: None,
             always_control: true,
+            max_cols: None,
+            max_rows: None,
             api_transport: crate::config::ApiTransport::Auto,
         }
     }
@@ -1699,6 +1710,26 @@ mod tests {
             argv[1..],
             ["pane", "vps", "w1:p1", "--ctl-path", "/state/vps.ctl"]
         );
+    }
+
+    /// An uncapped host's argv must not grow, and a capped one must round-trip
+    /// through the same parser the daemon's child uses.
+    #[test]
+    fn size_caps_reach_the_streamer_argv() {
+        let mut host = ssh_host();
+        host.always_control = false;
+        let uncapped = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new())("w1:p1");
+        assert!(!uncapped.iter().any(|a| a == "--max-cols" || a == "--max-rows"));
+
+        host.max_cols = Some(212);
+        host.max_rows = Some(58);
+        let argv = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new())("w1:p1");
+        let parsed = crate::pane::parse_args(&argv[2..]).expect("pane must parse daemon argv");
+        assert_eq!(parsed.max_cols, Some(212));
+        assert_eq!(parsed.max_rows, Some(58));
+        // the caps are a ceiling on control only — the observe request size is
+        // still whatever --cols/--rows said (here: unset, so the default)
+        assert!(!parsed.size_fixed);
     }
 
     #[test]

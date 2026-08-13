@@ -15,6 +15,10 @@
 //   --control-idle N    auto-release control after N seconds idle (default 3600)
 //   --always-control    start and stay in control: writable, no idle release,
 //                       and sized to the local pane so it fills
+//   --max-cols N        cap the size control asks the remote for (default:
+//   --max-rows N        uncapped — control fills the local pane). Set for a
+//                       remote with its own display: the remote keeps its own
+//                       geometry and the rest of the local pane stays blank.
 //
 // Every stream gets its own direct ssh connection (no shared ControlMaster):
 // isolated, and nothing persists to go stale on a flaky network.
@@ -62,6 +66,11 @@ pub struct Args {
     /// start and stay in control: writable, no idle release, and sized to the
     /// local pane so it fills. Set by the daemon from per-host config.
     pub always_control: bool,
+    /// upper bound on the size control asks the remote for. `None` = uncapped
+    /// (fill the local pane). Set by the daemon from per-host config; observe
+    /// is never capped, since it doesn't resize anything.
+    pub max_cols: Option<usize>,
+    pub max_rows: Option<usize>,
     /// daemon's ssh ControlMaster socket for this host; foreground polls reuse it
     /// (`ssh -S <path>`) to skip a handshake. None → polls connect directly.
     ///
@@ -91,6 +100,8 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
         control_idle_secs: 3600,
         size_fixed: false,
         always_control: false,
+        max_cols: None,
+        max_rows: None,
         ctl_path: None,
         container: None,
     };
@@ -119,6 +130,14 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
                     next("--control-idle")?.parse().map_err(|_| err("--control-idle must be a number"))?
             }
             "--always-control" => args.always_control = true,
+            "--max-cols" => {
+                args.max_cols =
+                    Some(next("--max-cols")?.parse().map_err(|_| err("--max-cols must be a number"))?)
+            }
+            "--max-rows" => {
+                args.max_rows =
+                    Some(next("--max-rows")?.parse().map_err(|_| err("--max-rows must be a number"))?)
+            }
             "--ctl-path" => args.ctl_path = Some(next("--ctl-path")?),
             "--container" => container_name = Some(next("--container")?),
             "--container-folder" => container_folder = Some(next("--container-folder")?),
@@ -130,7 +149,7 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
     }
     if positional.len() != 2 {
         return Err(err(
-            "usage: herdr-mirror pane <ssh-target> <pane-target> [--remote-bin PATH] [--cols N --rows N] [--dump]",
+            "usage: herdr-mirror pane <ssh-target> <pane-target> [--remote-bin PATH] [--cols N --rows N] [--max-cols N --max-rows N] [--dump]",
         ));
     }
     args.container = match (container_name, container_folder) {
@@ -322,6 +341,19 @@ const HERDR_NO_CLIENT_LAYOUT: (usize, usize) = (80, 24);
 /// resize. It self-heals the moment a client attaches.
 fn size_is_trusted((cols, rows): (usize, usize)) -> bool {
     cols > HERDR_NO_CLIENT_LAYOUT.0 || rows > HERDR_NO_CLIENT_LAYOUT.1
+}
+
+/// Clamp a local terminal size to the per-host control caps. Split out from
+/// `control_size` so the arithmetic is testable without an `App`.
+fn cap_size(
+    (cols, rows): (usize, usize),
+    max_cols: Option<usize>,
+    max_rows: Option<usize>,
+) -> (usize, usize) {
+    (
+        max_cols.map_or(cols, |cap| cols.min(cap)),
+        max_rows.map_or(rows, |cap| rows.min(cap)),
+    )
 }
 
 /// Mode to open with. Split out from `run` so the composition is testable.
@@ -626,6 +658,16 @@ impl App {
         (self.args.cols.max(c), self.args.rows.max(r))
     }
 
+    /// Size to enter (and stay in) control at. Control is authoritative on the
+    /// remote — the server resizes the remote pty to whatever we ask for — so a
+    /// host whose remote has its own display caps this and renders the remote at
+    /// its own geometry, leaving the rest of the local pane blank rather than
+    /// reflowing a screen someone over there is reading. Uncapped by default,
+    /// which is the pre-existing fill-the-pane behaviour.
+    fn control_size(&self) -> (usize, usize) {
+        cap_size(term_size(), self.args.max_cols, self.args.max_rows)
+    }
+
     /// Stop the child (clean release first for control) — never leave an
     /// orphan holding the remote attach lock.
     fn stop_session(&mut self) {
@@ -646,7 +688,7 @@ impl App {
         self.predict = Predictor::new();
         let (cols, rows) = match m {
             Mode::Observe => self.observe_size(),
-            Mode::Control => term_size(),
+            Mode::Control => self.control_size(),
         };
         if let Some(s) = self.session.take() {
             unsafe { libc::kill(s.pid, libc::SIGTERM) };
@@ -1028,7 +1070,9 @@ pub async fn run(args: Args) -> Result<()> {
                     app.switch_mode(Mode::Control);
                 }
                 if app.mode == Mode::Control {
-                    let (cols, rows) = term_size();
+                    // capped like the initial connect: a local window drag must
+                    // not push a capped host past its ceiling either
+                    let (cols, rows) = app.control_size();
                     app.send(json!({ "type": "terminal.resize", "cols": cols, "rows": rows })).await;
                 }
                 app.paint();
@@ -1094,6 +1138,27 @@ pub async fn run(args: Args) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Uncapped must stay byte-identical to the old `term_size()` call, or
+    /// every existing headless-remote config silently changes behaviour.
+    #[test]
+    fn uncapped_control_size_is_the_local_size() {
+        assert_eq!(cap_size((253, 50), None, None), (253, 50));
+    }
+
+    #[test]
+    fn caps_only_bite_when_the_local_pane_is_bigger() {
+        // the real case: local 253 cols vs a laptop that renders at 212
+        assert_eq!(cap_size((253, 50), Some(212), Some(58)), (212, 50));
+        // a local pane smaller than the cap is left alone — a cap is a ceiling,
+        // never a demand for a size the local window can't show
+        assert_eq!(cap_size((120, 30), Some(212), Some(58)), (120, 30));
+        // one axis capped, the other free
+        assert_eq!(cap_size((253, 50), Some(212), None), (212, 50));
+        assert_eq!(cap_size((253, 90), None, Some(58)), (253, 58));
+        // equal is not clamped away
+        assert_eq!(cap_size((212, 58), Some(212), Some(58)), (212, 58));
+    }
 
     #[test]
     fn wheel_always_semantic_scroll_even_on_tui_foreground() {
