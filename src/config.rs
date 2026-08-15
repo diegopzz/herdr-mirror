@@ -263,16 +263,30 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
     let global_always_control = raw.always_control.unwrap_or(true);
     // 0 is treated as unset rather than "clamp to nothing", same as an empty
     // remote_bin: a cap that would starve the remote of every column is a typo,
-    // not an instruction.
+    // not an instruction. Warn rather than dropping it silently — and say that
+    // it falls through, since 0 is NOT a way to un-cap one host under a global.
+    let mut warnings: Vec<String> = Vec::new();
     let size_cap = |v: Option<usize>| v.filter(|&n| n > 0);
+    for (key, v) in [("max_cols", raw.max_cols), ("max_rows", raw.max_rows)] {
+        if v == Some(0) {
+            warnings.push(format!("{key} = 0 ignored: 0 means unset, not \"cap to nothing\""));
+        }
+    }
     let global_max_cols = size_cap(raw.max_cols);
     let global_max_rows = size_cap(raw.max_rows);
     let mut hosts: Vec<HostConfig> = Vec::new();
-    let mut warnings: Vec<String> = Vec::new();
     for (name, value) in raw.hosts {
         let h: RawHost = value.try_into().map_err(|e| err(format!("[hosts.{name}]: {e}")))?;
         if h.enabled == Some(false) {
             continue;
+        }
+        for (key, v) in [("max_cols", h.max_cols), ("max_rows", h.max_rows)] {
+            if v == Some(0) {
+                warnings.push(format!(
+                    "[hosts.{name}]: {key} = 0 ignored; it falls through to any global cap \
+                     rather than clearing it"
+                ));
+            }
         }
         // Skip-with-warning, not abort. Aborting would let one typo'd entry
         // stop the daemon entirely and take every *other* host's mirrors down
@@ -635,5 +649,23 @@ mod tests {
         let e = load_config(&[a.clone(), b.clone()]).unwrap_err().to_string();
         assert!(e.contains(&a.join("hosts.toml").display().to_string()), "{e}");
         assert!(e.contains(&b.join("hosts.toml").display().to_string()), "{e}");
+    }
+
+    #[test]
+    fn a_zero_cap_warns_instead_of_vanishing() {
+        // silently dropping a typo'd cap leaves the user believing it applied
+        let c = parse_config("max_cols = 0\n[hosts.a]\ntarget = \"a\"\n").unwrap();
+        assert_eq!(c.hosts[0].max_cols, None);
+        assert!(c.warnings.iter().any(|w| w.contains("max_cols = 0 ignored")), "{:?}", c.warnings);
+
+        // and 0 per host is not a way to opt out of a global cap
+        let c =
+            parse_config("max_cols = 200\n[hosts.a]\ntarget = \"a\"\nmax_cols = 0\n").unwrap();
+        assert_eq!(c.hosts[0].max_cols, Some(200), "0 falls through to the global");
+        assert!(
+            c.warnings.iter().any(|w| w.contains("falls through to any global cap")),
+            "{:?}",
+            c.warnings
+        );
     }
 }

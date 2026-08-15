@@ -84,13 +84,6 @@ set `always_control = false` (globally or per host). Its mirrors become
 read-only: a live view with zero effect on the remote that escalates to control
 when you type and auto-releases after 1h idle (`ctrl+\` releases immediately).
 
-Control is authoritative on the remote — the server resizes the remote pty to
-whatever the controlling client asks for — so on such a host a wide local window
-reflows a screen someone over there is reading, every time control escalates.
-Add `max_cols` / `max_rows` (globally or per host) to cap what control asks for:
-the remote keeps its own geometry and the unused part of your local pane simply
-stays blank. Uncapped by default, so headless remotes still fill the pane.
-
 **Close / restore** — by default, closing a mirror (`prefix+x`) also closes the
 pane/workspace on the remote (`close_remote_on_local_close`; set it false to
 only stop mirroring and leave the remote — and its agent — running). When the
@@ -294,11 +287,6 @@ shell and a TUI there's a brief lag before the mouse mode catches up.
                          # idle release, and sized to your local pane so the
                          # remote fills it (ideal for headless remotes). Set
                          # false for read-only mirrors that escalate on type.
-# max_cols / max_rows    # unset by default = control fills your local pane.
-                         # Set to cap the size control asks the remote for, so a
-                         # remote with its own display keeps its own geometry
-                         # instead of reflowing to your window. Observe is never
-                         # capped (it doesn't resize anything).
 
 [hosts.work]
 target = "work"
@@ -306,9 +294,6 @@ target = "work"
 # remote_bin = "~/.local/bin/herdr"  # remote path if it's not on the remote PATH
 # always_control = false             # per-host override, e.g. a host you use
                                      # directly (don't drive its pane sizes)
-# max_cols = 212                     # per-host cap on the size control asks
-# max_rows = 58                      # for; pairs with always_control = false
-                                     # (that laptop's own terminal is 212x58)
 # enabled = true                     # false stops syncing this host without
                                      # deleting its config; mirrors stay put
 # api_transport = "auto"             # how to reach the remote API socket:

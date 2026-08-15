@@ -125,13 +125,17 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
                     next("--control-idle")?.parse().map_err(|_| err("--control-idle must be a number"))?
             }
             "--always-control" => args.always_control = true,
+            // 0 is unset here for the same reason config treats it that way:
+            // a zero cap would ask the remote for a zero-column terminal, which
+            // herdr rejects outright, killing the session twice over and
+            // stranding the pane in "control unavailable" over a typo.
             "--max-cols" => {
-                args.max_cols =
-                    Some(next("--max-cols")?.parse().map_err(|_| err("--max-cols must be a number"))?)
+                args.max_cols = Some(next("--max-cols")?.parse().map_err(|_| err("--max-cols must be a number"))?)
+                    .filter(|&n| n > 0)
             }
             "--max-rows" => {
-                args.max_rows =
-                    Some(next("--max-rows")?.parse().map_err(|_| err("--max-rows must be a number"))?)
+                args.max_rows = Some(next("--max-rows")?.parse().map_err(|_| err("--max-rows must be a number"))?)
+                    .filter(|&n| n > 0)
             }
             "--ctl-path" => args.ctl_path = Some(next("--ctl-path")?),
             "--container" => container_name = Some(next("--container")?),
@@ -1540,6 +1544,23 @@ mod tests {
         assert_eq!(observe_size_for(&a, (40, 20)), (70, 31));
         // --dump has no tty: exactly what was asked for
         assert_eq!(observe_size_for(&a, (0, 0)), (70, 31));
+    }
+
+    #[test]
+    fn a_zero_cap_on_the_cli_is_unset_not_a_zero_request() {
+        // herdr rejects a 0-column terminal, so a typo would kill the session
+        // twice and strand the pane in "control unavailable"
+        let argv: Vec<String> = ["h", "w1:p1", "--max-cols", "0", "--max-rows", "0"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let a = parse_args(&argv).unwrap();
+        assert_eq!(a.max_cols, None);
+        assert_eq!(a.max_rows, None);
+
+        let argv: Vec<String> =
+            ["h", "w1:p1", "--max-cols", "212"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(parse_args(&argv).unwrap().max_cols, Some(212));
     }
 
     #[test]
