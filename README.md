@@ -34,6 +34,8 @@ A remote can be another machine over **ssh**, or a **container** on this one
   (`ssh -o BatchMode=yes <host> true` must succeed without a prompt).
 - **Container hosts**: a working `docker` CLI, plus `socat` and herdr inside
   the image. No sshd, no keys, no published ports.
+- **Image paste on Linux** (optional): `wl-paste` or `xclip`, to read the
+  clipboard. macOS needs nothing; dropping files works either way.
 
 ## Installation
 
@@ -50,7 +52,8 @@ Then create the config at `~/.config/herdr-mirror/hosts.toml`:
 
 ```toml
 [hosts.work]
-target = "work"        # anything ssh accepts: alias, user@host, ssh://host:2222
+target = "work"         # anything ssh accepts: alias, user@host, ssh://host:2222
+# session = "project"   # mirror `herdr --session project` on that host
 ```
 
 That's it — the daemon autostarts when you focus a workspace, so within a few
@@ -236,23 +239,18 @@ the file already binds, and reloads herdr, so the key is live immediately;
 `unbind` removes only blocks that `bind` wrote. `remote-actions` also prints a
 paste-ready binding block.
 
-### Image paste
+### Paste and drop files
 
-herdr's native image paste (`remote_image_paste`, ctrl+v) only exists in
-`herdr --remote` — a mirror pane is attached to your *local* server, and the
-stream driving the remote carries no image message. Mirror panes close that
-gap themselves: press **ctrl+v** in a mirror pane and, if the local clipboard
-holds an image, it is uploaded over the pane's own transport (ssh, reusing the
-daemon's ControlMaster; or docker exec) to `~/.cache/herdr-mirror/pastes/` on
-the remote, and the resulting absolute path is pasted as bracketed text — an
-agent over there (claude, codex, …) reads the image from that path.
+**Ctrl+v** an image, or **drag files** onto a mirror pane. A local path means
+nothing on the remote, so the files are uploaded to
+`~/.cache/herdr-mirror/pastes/` there and the remote path is pasted instead,
+ready for an agent to open.
 
-When the clipboard has no image, the ctrl+v is forwarded unchanged (vim's
-visual-block and shell quoted-insert keep working); the only cost is the
-clipboard probe's latency on that one keystroke. Reading the clipboard uses
-`pngpaste` if installed, else AppleScript on macOS; `wl-paste` or `xclip` on
-Linux. Uploads are never cleaned up automatically — they're small, but
-`rm -rf ~/.cache/herdr-mirror/pastes` on the remote is always safe.
+Any file type, several at once, up to 32MB each. Ordinary pastes pass through
+untouched, and paths that already exist on the remote are left alone. Reading
+an image off the clipboard needs `wl-paste` or `xclip` on Linux (macOS and
+dropped files need nothing). Uploads aren't cleaned up; `rm -rf
+~/.cache/herdr-mirror/pastes` is always safe.
 
 ### Mouse
 
@@ -287,11 +285,18 @@ shell and a TUI there's a brief lag before the mouse mode catches up.
                          # idle release, and sized to your local pane so the
                          # remote fills it (ideal for headless remotes). Set
                          # false for read-only mirrors that escalate on type.
+# max_cols / max_rows    # cap the size control asks the remote for, so a
+                         # machine with its own display keeps its geometry.
+                         # A ceiling only, and never applies to watch-only.
 
 [hosts.work]
 target = "work"
 # prefix = "work"                    # sidebar prefix (default: the host key)
 # remote_bin = "~/.local/bin/herdr"  # remote path if it's not on the remote PATH
+# session = "project"                # mirror a named herdr session on this host
+                                     # (`herdr --session project`)
+# max_cols = 212                     # per-host size cap; pairs with
+# max_rows = 58                      # always_control = false
 # always_control = false             # per-host override, e.g. a host you use
                                      # directly (don't drive its pane sizes)
 # enabled = true                     # false stops syncing this host without
