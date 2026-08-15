@@ -1,0 +1,32 @@
+name: ci
+
+# Runs on every PR, because `release.yml` only fires on a tag — by then a
+# broken change is already merged. It also only runs `cargo build --release`,
+# which compiles the binary but NOT the `#[cfg(test)]` modules: PR #51 built
+# clean that way while `cargo test` failed on a struct literal in a test
+# helper, and nothing caught it.
+#
+# Both platforms, because the crate carries real per-OS behaviour (unix socket
+# path limits, macOS vs Linux state paths) and ships binaries for both.
+#
+# No `cargo fmt --check`: the tree is deliberately not rustfmt-default, so that
+# job would fail on every PR and teach contributors to ignore CI.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      # --locked so a dependency added without committing Cargo.lock fails here
+      # rather than drifting silently into a release build
+      - run: cargo test --locked
+      - run: cargo clippy --all-targets -- -D warnings

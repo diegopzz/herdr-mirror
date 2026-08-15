@@ -53,7 +53,7 @@ pub struct Args {
     pub ssh_target: String,
     pub pane_target: String,
     /// Configured remote herdr path. `None` = auto-resolve on the remote
-    /// (PATH, then `~/.local/bin/herdr`). See `config::remote_bin_expr`.
+    /// (PATH, then `~/.local/bin/herdr`). See `config::remote_herdr_expr`.
     pub remote_bin: Option<String>,
     pub cols: usize,
     pub rows: usize,
@@ -61,8 +61,6 @@ pub struct Args {
     pub session: Option<String>,
     /// auto-release control after this much input idle; 0 disables
     pub control_idle_secs: u64,
-    /// --cols/--rows are the remote pane's real size (plus margin), use as-is
-    pub size_fixed: bool,
     /// start and stay in control: writable, no idle release, and sized to the
     /// local pane so it fills. Set by the daemon from per-host config.
     pub always_control: bool,
@@ -98,7 +96,6 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
         dump: false,
         session: None,
         control_idle_secs: 3600,
-        size_fixed: false,
         always_control: false,
         max_cols: None,
         max_rows: None,
@@ -118,11 +115,9 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
             "--remote-bin" => args.remote_bin = Some(next("--remote-bin")?),
             "--cols" => {
                 args.cols = next("--cols")?.parse().map_err(|_| err("--cols must be a number"))?;
-                args.size_fixed = true;
             }
             "--rows" => {
                 args.rows = next("--rows")?.parse().map_err(|_| err("--rows must be a number"))?;
-                args.size_fixed = true;
             }
             "--session" => args.session = Some(next("--session")?),
             "--control-idle" => {
@@ -149,7 +144,7 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
     }
     if positional.len() != 2 {
         return Err(err(
-            "usage: herdr-mirror pane <ssh-target> <pane-target> [--remote-bin PATH] [--cols N --rows N] [--max-cols N --max-rows N] [--dump]",
+            "usage: herdr-mirror pane <ssh-target> <pane-target> [--remote-bin PATH] [--session NAME] [--cols N --rows N] [--max-cols N --max-rows N] [--dump]",
         ));
     }
     args.container = match (container_name, container_folder) {
@@ -204,6 +199,8 @@ enum Msg {
     /// result of a background foreground-process poll: Some(true)=shell,
     /// Some(false)=TUI, None=poll failed (keep last value)
     Foreground(Option<bool>),
+    Paste(crate::paste::Outcome),
+    Drop(crate::paste::DropResult),
 }
 
 struct Session {
@@ -219,19 +216,16 @@ pub(crate) fn sh_quote(s: &str) -> String {
 }
 
 fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx: mpsc::Sender<Msg>) -> Result<Session> {
-    let session_flag = args
-        .session
-        .as_ref()
-        .map(|s| format!(" --session {}", sh_quote(s)))
-        .unwrap_or_default();
     // Configured paths stay unquoted so remote-shell ~ expands; auto mode is an
     // `sh -c` resolver that takes the trailing words as "$@" (see
-    // config::remote_bin_expr).
-    let bin = crate::config::remote_bin_expr(args.remote_bin.as_deref());
+    // config::remote_herdr_expr).
+    let bin = crate::config::remote_herdr_expr(
+        args.remote_bin.as_deref(),
+        args.session.as_deref(),
+    );
     let cmd = format!(
-        "exec {}{} terminal session {} {} --cols {} --rows {}",
+        "exec {} terminal session {} {} --cols {} --rows {}",
         bin,
-        session_flag,
         mode.as_str(),
         sh_quote(&args.pane_target),
         cols,
@@ -354,6 +348,22 @@ fn cap_size(
         max_cols.map_or(cols, |cap| cols.min(cap)),
         max_rows.map_or(rows, |cap| rows.min(cap)),
     )
+}
+
+/// Size to request for an observe stream. Split out from `App::observe_size` so
+/// the floor is testable.
+///
+/// `--cols/--rows` are a floor, never an exact request. As a floor they still do
+/// their original job: the request must be >= the remote PTY size or the server
+/// clips its bottom rows away, and the daemon's numbers already carry a margin.
+/// As an exact request they are wrong — the daemon samples the *remote* pane's
+/// rect when it spawns the streamer, and a headless remote reports the no-client
+/// placeholder, so the numbers are small. Control then resizes the remote pty to
+/// this pane and nothing shrinks it back on release, so asking for the daemon's
+/// numbers again would stream a crop of a screen that has since grown, painted
+/// into the corner of a much larger pane.
+fn observe_size_for(args: &Args, term: (usize, usize)) -> (usize, usize) {
+    (args.cols.max(term.0), args.rows.max(term.1))
 }
 
 /// Mode to open with. Split out from `run` so the composition is testable.
@@ -485,6 +495,85 @@ fn contains_wheel_press(bytes: &[u8]) -> bool {
     false
 }
 
+/// Cap on a partially-received bracketed paste. Past this we stop waiting for
+/// a terminator and flush what we have: a huge paste is still forwarded, it
+/// just loses the drop treatment rather than buffering without bound.
+const MAX_PASTE_BYTES: usize = 1024 * 1024;
+
+const PASTE_START: &[u8] = b"\x1b[200~";
+const PASTE_END: &[u8] = b"\x1b[201~";
+
+/// Input held back while an upload is in flight (see `route_input`).
+enum Queued {
+    Raw(Vec<u8>),
+    Body(Vec<u8>),
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum PasteSplit {
+    /// a paste has begun but not finished; nothing to do yet
+    Pending,
+    /// no paste involved: forward as-is
+    Passthrough(Vec<u8>),
+    Complete { before: Vec<u8>, body: Vec<u8>, after: Vec<u8> },
+}
+
+fn find_seq(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Longest suffix of `hay` that is a *proper* prefix of `needle`, so a marker
+/// straddling two reads is held rather than forwarded in pieces.
+fn trailing_partial(hay: &[u8], needle: &[u8]) -> usize {
+    (1..needle.len().min(hay.len()) + 1)
+        .rev()
+        .find(|&n| n < needle.len() && hay[hay.len() - n..] == needle[..n])
+        .unwrap_or(0)
+}
+
+/// Pull the next complete bracketed paste out of `buf` + `chunk`.
+///
+/// Pure so the framing can be table-tested without a pane: every interesting
+/// case (split reads, a START with no END, bytes either side, several pastes
+/// in one read, the oversize flush) lives here rather than in the event loop.
+pub(crate) fn split_paste(buf: &mut Vec<u8>, chunk: Vec<u8>) -> PasteSplit {
+    // fast path for ordinary typing: nothing buffered and no marker starting
+    if buf.is_empty()
+        && find_seq(&chunk, PASTE_START).is_none()
+        && trailing_partial(&chunk, PASTE_START) == 0
+    {
+        return PasteSplit::Passthrough(chunk);
+    }
+    buf.extend_from_slice(&chunk);
+
+    // a paste that never terminates must not buffer without bound
+    if buf.len() > MAX_PASTE_BYTES {
+        return PasteSplit::Passthrough(std::mem::take(buf));
+    }
+
+    let Some(start) = find_seq(buf, PASTE_START) else {
+        // hold only a possible partial marker; release everything before it
+        let keep = trailing_partial(buf, PASTE_START);
+        let cut = buf.len() - keep;
+        if cut == 0 {
+            return PasteSplit::Pending;
+        }
+        let tail = buf.split_off(cut);
+        let head = std::mem::replace(buf, tail);
+        return PasteSplit::Passthrough(head);
+    };
+    let Some(end) = find_seq(&buf[start..], PASTE_END).map(|i| start + i) else {
+        return PasteSplit::Pending;
+    };
+
+    let all = std::mem::take(buf);
+    PasteSplit::Complete {
+        before: all[..start].to_vec(),
+        body: all[start + PASTE_START.len()..end].to_vec(),
+        after: all[end + PASTE_END.len()..].to_vec(),
+    }
+}
+
 fn has_mouse_seq(bytes: &[u8]) -> bool {
     bytes.windows(3).any(|w| w == [0x1b, b'[', b'<'])
 }
@@ -494,8 +583,54 @@ fn has_mouse_seq(bytes: &[u8]) -> bool {
 // the wrapper state machine
 
 const BACKOFF: [u64; 4] = [1000, 2000, 5000, 10000];
+
+/// Rung used once the remote pane is known to be gone. Deliberately still a
+/// retry and not a stop: the daemon owns mirror lifecycle and reaps a pane
+/// whose remote has been absent for two converge polls, so the streamer's job
+/// here is to wait quietly for that rather than to decide it is finished. It
+/// also keeps "gone" recoverable, which it sometimes is — a remote herdr
+/// restarting renumbers pane ids while session restore runs.
+const GONE_BACKOFF_MS: u64 = 60_000;
+
 const SWITCH_GAP: Duration = Duration::from_millis(200);
 const QUICK_CONTROL_FAILURE: Duration = Duration::from_secs(4);
+
+/// Is this failure "the pane we stream is gone", as opposed to any other
+/// failure that happens to mention something missing?
+///
+/// Matches herdr's whole sentence (`headless.rs`: "terminal target {t} not
+/// found") with OUR target in it, rather than loose substrings. That keeps it
+/// off the remote-bin resolver's `exec: …/herdr: not found`, which means herdr
+/// is absent on that host — a different problem with a different fix — and
+/// stops a target being confused with one that merely shares its prefix
+/// (`w1:p1` vs `w1:p10`, both real ids in herdr's base-32 alphabet).
+///
+/// Note the pane dying *underneath* a live stream reports differently
+/// ("terminal attach ended: terminal {term_id} not found", carrying herdr's
+/// internal terminal id, not ours). That deliberately does not match: the next
+/// attempt asks for the pane target and gets the canonical sentence a second
+/// later, so this fires one cycle behind rather than being loosened.
+fn target_gone(reason: &str, pane_target: &str) -> bool {
+    if pane_target.is_empty() {
+        return false;
+    }
+    reason
+        .to_ascii_lowercase()
+        .contains(&format!("terminal target {} not found", pane_target.to_ascii_lowercase()))
+}
+
+/// Delay before the next attempt, and the ladder position to keep.
+///
+/// Pure so the rung and the ladder-resume are testable without a live pane.
+/// A gone target does NOT consume a rung: if the pane comes back and later
+/// fails transiently, that failure should start where the fast ladder left
+/// off rather than at the top.
+fn reconnect_delay(gone: bool, idx: usize) -> (u64, usize) {
+    if gone {
+        return (GONE_BACKOFF_MS, idx);
+    }
+    (BACKOFF[idx.min(BACKOFF.len() - 1)], idx + 1)
+}
 
 struct App {
     args: Args,
@@ -537,6 +672,14 @@ struct App {
     /// whether the local pane is currently in application cursor mode (?1h), held
     /// to match the remote's so forwarded arrows arrive in the form it expects
     app_cursor_keys: bool,
+    paste_inflight: bool,
+    /// partially-received bracketed paste (see `intercept_paste`)
+    paste_buf: Vec<u8>,
+    /// input held back while an upload is in flight, flushed in order after
+    paste_queue: Vec<Queued>,
+    /// the payload that started the in-flight upload, so it can be forwarded
+    /// unchanged when every path turns out to exist on the remote already
+    paste_original: Option<Vec<u8>>,
 }
 
 /// minimum spacing between foreground polls — each is an ssh handshake, so we
@@ -577,6 +720,15 @@ impl App {
         self.hint_clear_at = Some(Instant::now() + Duration::from_millis(1500));
     }
 
+    /// A hint with no expiry, for work whose duration we don't know: an upload
+    /// can outlast the usual 1.5s and the pane would otherwise look idle while
+    /// it is busy. Whoever set it replaces it when the work resolves.
+    fn hint_sticky(&mut self, text: &str) {
+        self.renderer.status(text);
+        self.paint();
+        self.hint_clear_at = None;
+    }
+
     /// Kick a background poll of the remote pane's foreground process, throttled
     /// so a mouse burst doesn't spawn an ssh per event. The result arrives as
     /// Msg::Foreground and updates `remote_is_shell`.
@@ -589,6 +741,7 @@ impl App {
         let tx = self.tx.clone();
         let ssh = self.args.ssh_target.clone();
         let bin = self.args.remote_bin.clone();
+        let session = self.args.session.clone();
         let pane = self.args.pane_target.clone();
         let ctl = self.args.ctl_path.clone();
         let container = self.args.container.clone();
@@ -596,6 +749,7 @@ impl App {
             let v = crate::foreground::poll(
                 &ssh,
                 bin.as_deref(),
+                session.as_deref(),
                 &pane,
                 ctl.as_deref(),
                 container.as_ref(),
@@ -649,13 +803,7 @@ impl App {
     }
 
     fn observe_size(&self) -> (usize, usize) {
-        // must request >= the remote PTY size or the server clips its bottom
-        // rows; daemon-passed sizes already include a margin
-        if self.args.size_fixed {
-            return (self.args.cols, self.args.rows);
-        }
-        let (c, r) = if self.tty { term_size() } else { (0, 0) };
-        (self.args.cols.max(c), self.args.rows.max(r))
+        observe_size_for(&self.args, if self.tty { term_size() } else { (0, 0) })
     }
 
     /// Size to enter (and stay in) control at. Control is authoritative on the
@@ -723,14 +871,33 @@ impl App {
     }
 
     fn schedule_reconnect(&mut self, m: Mode, reason: &str) {
-        let delay = BACKOFF[self.backoff_idx.min(BACKOFF.len() - 1)];
-        self.backoff_idx += 1;
-        let suffix = if reason.is_empty() { String::new() } else { format!(" — {reason}") };
-        self.renderer
-            .status(&format!("reconnecting in {}s ({}){suffix}", delay / 1000, m.as_str()));
+        // Only slow down once we are back in observe. In control the existing
+        // quick-failure fallback needs its fast retries to reach two failures
+        // and drop the pane to observe within seconds; a 60s rung there would
+        // leave an always_control pane stuck in control for a minute.
+        let gone = m == Mode::Observe && target_gone(reason, &self.args.pane_target);
+        let (delay, idx) = reconnect_delay(gone, self.backoff_idx);
+        self.backoff_idx = idx;
+
+        if gone {
+            // Repainted every cycle on purpose: handle_frame paints herdr's
+            // raw close reason before us on each attempt, so saying this once
+            // would leave the misleading "terminal closed" line on screen from
+            // the second cycle onward. The renderer diffs rows, so an
+            // unchanged line costs one row write a minute.
+            self.renderer.status(&format!("remote pane {} is gone", self.args.pane_target));
+            // and nothing may expire it out from under us: the control→observe
+            // fallback sets a 1.5s hint just before this path runs
+            self.hint_clear_at = None;
+        } else {
+            let suffix = if reason.is_empty() { String::new() } else { format!(" — {reason}") };
+            self.renderer
+                .status(&format!("reconnecting in {}s ({}){suffix}", delay / 1000, m.as_str()));
+        }
         self.paint();
         self.reconnect_at = Some((Instant::now() + Duration::from_millis(delay), m));
     }
+
 
     fn switch_mode(&mut self, m: Mode) {
         // already settled or scheduled — don't restart. Without this guard,
@@ -820,7 +987,124 @@ impl App {
         }
     }
 
-    async fn handle_stdin(&mut self, buf: Vec<u8>) {
+    /// Drain every complete paste in this chunk, in order.
+    ///
+    /// Deliberately a loop, not a one-shot: two drops land in a single read
+    /// with nothing between them (a drop carries no terminator at all — which
+    /// is precisely why `run` asks for DECSET 2004), so handling only the
+    /// first would silently swallow the second, and leave its markers in the
+    /// tail to be forwarded raw at the remote.
+    async fn handle_stdin(&mut self, chunk: Vec<u8>) {
+        let mut chunk = chunk;
+        loop {
+            match split_paste(&mut self.paste_buf, chunk) {
+                PasteSplit::Pending => return,
+                PasteSplit::Passthrough(bytes) => return self.route_input(bytes).await,
+                PasteSplit::Complete { before, body, after } => {
+                    self.route_input(before).await;
+                    self.route_paste_body(body).await;
+                    if after.is_empty() {
+                        return;
+                    }
+                    chunk = after;
+                }
+            }
+        }
+    }
+
+    /// Ordinary input, held back while an upload is in flight so the pasted
+    /// remote paths cannot be overtaken by whatever was typed after them.
+    async fn route_input(&mut self, bytes: Vec<u8>) {
+        if bytes.is_empty() {
+            return;
+        }
+        if self.paste_inflight {
+            self.paste_queue.push(Queued::Raw(bytes));
+            return;
+        }
+        self.handle_stdin_inner(bytes).await;
+    }
+
+    /// A complete paste body, markers already stripped. A file drop is
+    /// uploaded; anything else is forwarded verbatim as if it had been typed.
+    async fn route_paste_body(&mut self, body: Vec<u8>) {
+        if self.paste_inflight {
+            self.paste_queue.push(Queued::Body(body));
+            return;
+        }
+        // lossy only for the probe; the forward path keeps the original bytes
+        let Some(paths) = crate::paste::dropped_paths(&String::from_utf8_lossy(&body)) else {
+            self.handle_stdin_inner(body).await;
+            return;
+        };
+
+        self.paste_inflight = true;
+        self.paste_original = Some(body);
+        self.hint_sticky(&format!("uploading {} file(s)…", paths.len()));
+        let tx = self.tx.clone();
+        let ssh = self.args.ssh_target.clone();
+        let ctl = self.args.ctl_path.clone();
+        let container = self.args.container.clone();
+        tokio::spawn(async move {
+            let result =
+                crate::paste::files_to_remote(&paths, &ssh, ctl.as_deref(), container.as_ref())
+                    .await;
+            let _ = tx.send(Msg::Drop(result)).await;
+        });
+    }
+
+    async fn handle_drop(&mut self, result: crate::paste::DropResult) {
+        self.paste_inflight = false;
+        let original = self.paste_original.take();
+        if let Some(text) = &result.text {
+            self.deliver_input(crate::paste::bracketed(text)).await;
+            self.hint(&format!("→ {text}"));
+        } else if result.unchanged {
+            // every path already exists over there, so the user meant those
+            // files: forward what they actually dropped
+            if let Some(body) = original {
+                self.handle_stdin_inner(body).await;
+            }
+        }
+        if let Some(e) = result.error {
+            self.hint(&format!("drop failed: {e}"));
+        }
+        self.drain_paste_queue().await;
+    }
+
+    /// Flush input held during an upload. Stops if a queued drop starts a new
+    /// upload, leaving the remainder queued behind it so order is preserved.
+    async fn drain_paste_queue(&mut self) {
+        let mut items = std::mem::take(&mut self.paste_queue).into_iter();
+        while let Some(item) = items.next() {
+            match item {
+                Queued::Raw(b) => self.handle_stdin_inner(b).await,
+                Queued::Body(b) => {
+                    self.route_paste_body(b).await;
+                    if self.paste_inflight {
+                        self.paste_queue.extend(items);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn handle_stdin_inner(&mut self, buf: Vec<u8>) {
+        if buf.len() == 1 && buf[0] == 0x16 && !self.paste_inflight {
+            self.paste_inflight = true;
+            let tx = self.tx.clone();
+            let ssh = self.args.ssh_target.clone();
+            let ctl = self.args.ctl_path.clone();
+            let container = self.args.container.clone();
+            tokio::spawn(async move {
+                let outcome =
+                    crate::paste::clipboard_to_remote(&ssh, ctl.as_deref(), container.as_ref())
+                        .await;
+                let _ = tx.send(Msg::Paste(outcome)).await;
+            });
+            return;
+        }
         if self.mode == Mode::Observe || self.switching_to == Some(Mode::Observe) {
             // no quit key: the wrapper's lifecycle belongs to the hosting pane
             if has_mouse_seq(&buf) {
@@ -912,6 +1196,38 @@ impl App {
             }
         }
     }
+
+    async fn deliver_input(&mut self, buf: Vec<u8>) {
+        if self.mode == Mode::Observe || self.switching_to == Some(Mode::Observe) {
+            self.control_sticky = false;
+            self.pending_input.push(buf);
+            self.switch_mode(Mode::Control);
+            return;
+        }
+        self.last_input = Instant::now();
+        if self.switching_to == Some(Mode::Control) || self.session.is_none() {
+            self.pending_input.push(buf);
+            if let Some((_, m)) = self.reconnect_at {
+                self.reconnect_at = Some((Instant::now(), m));
+            }
+            return;
+        }
+        self.send(json!({ "type": "terminal.input", "bytes": B64.encode(&buf) })).await;
+    }
+
+    async fn handle_paste(&mut self, outcome: crate::paste::Outcome) {
+        self.paste_inflight = false;
+        match outcome {
+            crate::paste::Outcome::NoImage => self.deliver_input(vec![0x16]).await,
+            crate::paste::Outcome::Pasted(path) => {
+                self.deliver_input(crate::paste::bracketed(&path)).await;
+                self.hint(&format!("→ {path}"));
+            }
+            crate::paste::Outcome::Failed(e) => {
+                self.hint(&format!("image paste failed: {e}"));
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -946,7 +1262,11 @@ pub async fn run(args: Args) -> Result<()> {
     let raw = if tty {
         // 1002/1006: button-event mouse tracking with SGR encoding, so wheel and
         // clicks reach us instead of scrolling the hosting pane's scrollback
-        write_stdout("\x1b[?1049h\x1b[2J\x1b[H\x1b[?1002h\x1b[?1006h");
+        // 2004 (bracketed paste) is asked for purely to get framing: herdr
+        // only wraps a paste when the pane's app has enabled it, and a file
+        // drop otherwise arrives as bare text with no terminator at all. See
+        // `intercept_paste`; the markers never reach the remote.
+        write_stdout("\x1b[?1049h\x1b[2J\x1b[H\x1b[?1002h\x1b[?1006h\x1b[?2004h");
         RawMode::enable()
     } else {
         None
@@ -999,6 +1319,10 @@ pub async fn run(args: Args) -> Result<()> {
         // startup leaves the pane in normal cursor mode; the first classification
         // moves it if the remote turns out to be a TUI
         app_cursor_keys: false,
+        paste_inflight: false,
+        paste_buf: Vec::new(),
+        paste_queue: Vec::new(),
+        paste_original: None,
     };
     // Control is authoritative on the remote: the server resizes the remote pty
     // to whatever we ask for, beating even a larger live client over there. So
@@ -1057,6 +1381,8 @@ pub async fn run(args: Args) -> Result<()> {
                         app.sync_mouse_grab();
                         app.sync_cursor_key_mode();
                     },
+                    Some(Msg::Paste(outcome)) => app.handle_paste(outcome).await,
+                    Some(Msg::Drop(result)) => app.handle_drop(result).await,
                 }
             }
             _ = sigwinch.recv() => {
@@ -1127,7 +1453,7 @@ pub async fn run(args: Args) -> Result<()> {
     if tty {
         // ?1l with the rest: leaving the hosting pane in application cursor mode
         // would misencode arrows for whatever runs there next
-        write_stdout("\x1b[?1002l\x1b[?1006l\x1b[?1l\x1b[?25h\x1b[?1049l");
+        write_stdout("\x1b[?2004l\x1b[?1002l\x1b[?1006l\x1b[?1l\x1b[?25h\x1b[?1049l");
     }
     if let Some(raw) = raw {
         raw.restore();
@@ -1199,6 +1525,24 @@ mod tests {
     }
 
     #[test]
+    fn observe_size_treats_daemon_sizes_as_a_floor() {
+        // what the daemon spawns a streamer with for a headless remote: the
+        // no-client placeholder rect plus its margin
+        let argv: Vec<String> = ["work", "w1:p1", "--cols", "70", "--rows", "31"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let a = parse_args(&argv).unwrap();
+        // control has already resized the remote pty to this pane, and release
+        // does not shrink it back — observing at 70x31 would stream a crop
+        assert_eq!(observe_size_for(&a, (314, 92)), (314, 92));
+        // a pane smaller than the remote still gets the daemon's margin
+        assert_eq!(observe_size_for(&a, (40, 20)), (70, 31));
+        // --dump has no tty: exactly what was asked for
+        assert_eq!(observe_size_for(&a, (0, 0)), (70, 31));
+    }
+
+    #[test]
     fn arg_parsing() {
         let argv: Vec<String> =
             ["work", "w9:p1", "--remote-bin", "/opt/herdr", "--cols", "176", "--rows", "66"]
@@ -1210,7 +1554,6 @@ mod tests {
         assert_eq!(a.pane_target, "w9:p1");
         assert_eq!(a.remote_bin.as_deref(), Some("/opt/herdr"));
         assert_eq!((a.cols, a.rows), (176, 66));
-        assert!(a.size_fixed);
         assert!(parse_args(&["onlyone".to_string()]).is_err());
         assert!(parse_args(&["a".into(), "b".into(), "--visibility-file".into(), "x".into()]).is_err());
     }
@@ -1260,4 +1603,172 @@ mod tests {
         assert!(!size_is_trusted((44, 16)));
         assert!(!size_is_trusted((49, 23)));
     }
+
+    // --- paste framing -----------------------------------------------------
+    // The bugs these pin were all real: a one-shot version dropped the second
+    // drop in a read, leaked markers from the tail, and corrupted non-UTF-8.
+
+    const S: &[u8] = b"\x1b[200~";
+    const E: &[u8] = b"\x1b[201~";
+
+    fn split(buf: &mut Vec<u8>, chunk: &[u8]) -> PasteSplit {
+        split_paste(buf, chunk.to_vec())
+    }
+
+    fn seq(parts: &[&[u8]]) -> Vec<u8> {
+        parts.concat()
+    }
+
+    #[test]
+    fn ordinary_typing_passes_straight_through() {
+        let mut buf = Vec::new();
+        assert_eq!(split(&mut buf, b"a"), PasteSplit::Passthrough(b"a".to_vec()));
+        assert_eq!(split(&mut buf, b"\x1b[A"), PasteSplit::Passthrough(b"\x1b[A".to_vec()));
+        assert!(buf.is_empty(), "typing must not buffer");
+    }
+
+    #[test]
+    fn paste_split_across_reads_reassembles() {
+        let mut buf = Vec::new();
+        assert_eq!(split(&mut buf, &seq(&[S, b"he"])), PasteSplit::Pending);
+        assert_eq!(split(&mut buf, b"llo"), PasteSplit::Pending);
+        assert_eq!(
+            split(&mut buf, E),
+            PasteSplit::Complete { before: vec![], body: b"hello".to_vec(), after: vec![] }
+        );
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn start_marker_split_across_reads_is_not_leaked() {
+        // the 6-byte introducer straddling a read boundary must be held, not
+        // forwarded in pieces (which would print ESC[20 at the remote)
+        let mut buf = Vec::new();
+        assert_eq!(split(&mut buf, b"\x1b[20"), PasteSplit::Pending);
+        assert_eq!(
+            split(&mut buf, &seq(&[b"0~/tmp/a.png", E])),
+            PasteSplit::Complete { before: vec![], body: b"/tmp/a.png".to_vec(), after: vec![] }
+        );
+    }
+
+    #[test]
+    fn bytes_around_the_markers_are_preserved() {
+        let mut buf = Vec::new();
+        assert_eq!(
+            split(&mut buf, &seq(&[b"pre", S, b"mid", E, b"post"])),
+            PasteSplit::Complete {
+                before: b"pre".to_vec(),
+                body: b"mid".to_vec(),
+                after: b"post".to_vec(),
+            }
+        );
+    }
+
+    #[test]
+    fn two_pastes_in_one_read_are_drained_in_order() {
+        // the regression: only the first was handled and the rest discarded,
+        // so a second drop vanished and its markers reached the remote raw
+        let mut buf = Vec::new();
+        let PasteSplit::Complete { body, after, .. } =
+            split(&mut buf, &seq(&[S, b"one", E, S, b"two", E]))
+        else {
+            panic!("expected first paste")
+        };
+        assert_eq!(body, b"one");
+        assert_eq!(
+            split(&mut buf, &after),
+            PasteSplit::Complete { before: vec![], body: b"two".to_vec(), after: vec![] },
+            "feeding the tail back must yield the second paste"
+        );
+    }
+
+    #[test]
+    fn keystroke_after_a_paste_survives() {
+        let mut buf = Vec::new();
+        let PasteSplit::Complete { after, .. } = split(&mut buf, &seq(&[S, b"/tmp/a", E, b"\r"]))
+        else {
+            panic!("expected paste")
+        };
+        assert_eq!(after, b"\r", "the trailing keystroke must not be eaten");
+    }
+
+    #[test]
+    fn unterminated_paste_flushes_at_the_cap_without_duplicating() {
+        let mut buf = Vec::new();
+        assert_eq!(split(&mut buf, S), PasteSplit::Pending);
+        let big = vec![b'x'; MAX_PASTE_BYTES + 1];
+        let PasteSplit::Passthrough(out) = split(&mut buf, &big) else {
+            panic!("expected a flush")
+        };
+        assert_eq!(out.len(), S.len() + big.len(), "every byte exactly once");
+        assert!(buf.is_empty(), "buffer must not keep a copy");
+    }
+
+    #[test]
+    fn non_utf8_paste_body_is_forwarded_byte_exact() {
+        // the body is only lossily decoded to probe for paths; what gets
+        // forwarded must be the original bytes
+        let mut buf = Vec::new();
+        let PasteSplit::Complete { body, .. } = split(&mut buf, &seq(&[S, b"caf\xe9", E])) else {
+            panic!("expected paste")
+        };
+        assert_eq!(body, b"caf\xe9", "0xE9 must not become U+FFFD");
+    }
+
+    #[test]
+    fn target_gone_matches_only_this_pane_being_gone() {
+        // the real sentence, captured from herdr against a missing pane
+        assert!(target_gone(
+            "terminal session observe failed: terminal target w9Z:p99 not found",
+            "w9Z:p99"
+        ));
+        assert!(target_gone(
+            "terminal session control failed: terminal target w1:p1 not found",
+            "w1:p1"
+        ));
+
+        // the false positive that matters most: herdr absent on the remote.
+        // The auto-resolver execs `$(command -v herdr || echo ~/.local/bin/herdr)`,
+        // so a host without herdr fails with a shell not-found — a different
+        // problem that a slow rung would wrongly paper over.
+        assert!(!target_gone("sh: 1: exec: /home/u/.local/bin/herdr: not found", "w9Z:p99"));
+
+        // a target that merely shares our prefix: p1 and p10 are both real ids
+        assert!(!target_gone(
+            "terminal session observe failed: terminal target w1:p10 not found",
+            "w1:p1"
+        ));
+        // ...and another pane's disappearance is not ours
+        assert!(!target_gone(
+            "terminal session observe failed: terminal target w1:p4 not found",
+            "w9Z:p99"
+        ));
+
+        // ordinary transients stay on the fast ladder
+        assert!(!target_gone("api timeout: session.snapshot", "w9Z:p99"));
+        assert!(!target_gone("ssh timeout", "w9Z:p99"));
+        assert!(!target_gone("", "w9Z:p99"));
+        // an empty target must not turn `contains` into "matches everything"
+        assert!(!target_gone("terminal target w1:p1 not found", ""));
+    }
+
+    #[test]
+    fn a_gone_target_slows_down_without_consuming_the_ladder() {
+        // the fix: 10s forever becomes one attempt a minute
+        assert_eq!(reconnect_delay(true, 0), (GONE_BACKOFF_MS, 0));
+        assert_eq!(reconnect_delay(true, 3), (GONE_BACKOFF_MS, 3));
+
+        // the fast ladder is unchanged and still clamps at its last rung
+        assert_eq!(reconnect_delay(false, 0), (1000, 1));
+        assert_eq!(reconnect_delay(false, 1), (2000, 2));
+        assert_eq!(reconnect_delay(false, 3), (10000, 4));
+        assert_eq!(reconnect_delay(false, 99), (10000, 100));
+
+        // a gone spell must not burn rungs: a transient afterwards resumes
+        // where the ladder was, rather than restarting at 1s
+        let (_, idx) = reconnect_delay(false, 0);
+        let (_, idx) = reconnect_delay(true, idx);
+        assert_eq!(reconnect_delay(false, idx), (2000, 2));
+    }
+
 }
