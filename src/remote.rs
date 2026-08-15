@@ -610,6 +610,8 @@ mod tests {
             prefix: name.into(),
             remote_bin: None,
             session: None,
+            max_cols: None,
+            max_rows: None,
             api_transport: ApiTransport::Auto,
             always_control: true,
         }

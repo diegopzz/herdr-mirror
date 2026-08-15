@@ -107,6 +107,14 @@ pub struct HostConfig {
     /// the local pane so it fills). Default on; ideal for headless remotes. Turn
     /// off per host for a remote a human is actively using directly.
     pub always_control: bool,
+    /// Cap the size control asks the remote for. `None` = uncapped: fill the
+    /// local pane, which is right for a headless remote nobody looks at.
+    /// Control is authoritative on the remote, so on a host with its own
+    /// display an uncapped wide local window reflows a screen someone is
+    /// reading; capping renders the remote at its own width and leaves the rest
+    /// of the local pane blank instead. Observe is unaffected either way.
+    pub max_cols: Option<usize>,
+    pub max_rows: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -150,6 +158,8 @@ struct RawConfig {
     default_host: Option<String>,
     close_remote_on_local_close: Option<bool>,
     always_control: Option<bool>,
+    max_cols: Option<usize>,
+    max_rows: Option<usize>,
     // toml::Table (preserve_order) keeps declaration order — the first host
     // is the remote-create fallback, so order is user-visible
     #[serde(default)]
@@ -169,6 +179,8 @@ struct RawHost {
     session: Option<String>,
     enabled: Option<bool>,
     always_control: Option<bool>,
+    max_cols: Option<usize>,
+    max_rows: Option<usize>,
     api_transport: Option<String>,
 }
 
@@ -249,12 +261,32 @@ pub fn load_config(candidates: &[PathBuf]) -> Result<MirrorConfig> {
 pub fn parse_config(text: &str) -> Result<MirrorConfig> {
     let raw: RawConfig = toml::from_str(text)?;
     let global_always_control = raw.always_control.unwrap_or(true);
-    let mut hosts: Vec<HostConfig> = Vec::new();
+    // 0 is treated as unset rather than "clamp to nothing", same as an empty
+    // remote_bin: a cap that would starve the remote of every column is a typo,
+    // not an instruction. Warn rather than dropping it silently — and say that
+    // it falls through, since 0 is NOT a way to un-cap one host under a global.
     let mut warnings: Vec<String> = Vec::new();
+    let size_cap = |v: Option<usize>| v.filter(|&n| n > 0);
+    for (key, v) in [("max_cols", raw.max_cols), ("max_rows", raw.max_rows)] {
+        if v == Some(0) {
+            warnings.push(format!("{key} = 0 ignored: 0 means unset, not \"cap to nothing\""));
+        }
+    }
+    let global_max_cols = size_cap(raw.max_cols);
+    let global_max_rows = size_cap(raw.max_rows);
+    let mut hosts: Vec<HostConfig> = Vec::new();
     for (name, value) in raw.hosts {
         let h: RawHost = value.try_into().map_err(|e| err(format!("[hosts.{name}]: {e}")))?;
         if h.enabled == Some(false) {
             continue;
+        }
+        for (key, v) in [("max_cols", h.max_cols), ("max_rows", h.max_rows)] {
+            if v == Some(0) {
+                warnings.push(format!(
+                    "[hosts.{name}]: {key} = 0 ignored; it falls through to any global cap \
+                     rather than clearing it"
+                ));
+            }
         }
         // Skip-with-warning, not abort. Aborting would let one typo'd entry
         // stop the daemon entirely and take every *other* host's mirrors down
@@ -286,6 +318,8 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
             remote_bin: h.remote_bin.filter(|s| !s.is_empty()),
             session: h.session.filter(|s| !s.is_empty()),
             always_control: h.always_control.unwrap_or(global_always_control),
+            max_cols: size_cap(h.max_cols).or(global_max_cols),
+            max_rows: size_cap(h.max_rows).or(global_max_rows),
             docker_bin: h.docker_bin.unwrap_or_else(|| "docker".into()),
             api_transport,
             kind,
@@ -354,6 +388,41 @@ mod tests {
         let b = c.hosts.iter().find(|h| h.name == "b").unwrap();
         assert!(!a.always_control); // inherits global off
         assert!(b.always_control); // per-host override on
+    }
+
+    #[test]
+    fn size_caps_default_off_and_override_per_host() {
+        // nothing set anywhere: uncapped, i.e. today's fill-the-pane behaviour
+        let c = parse_config("[hosts.a]\ntarget = \"a\"\n").unwrap();
+        assert_eq!(c.hosts[0].max_cols, None);
+        assert_eq!(c.hosts[0].max_rows, None);
+
+        // global cap, one host narrowing it further
+        let c = parse_config(
+            "max_cols = 200\n\
+             [hosts.a]\ntarget = \"a\"\n\
+             [hosts.b]\ntarget = \"b\"\nmax_cols = 120\nmax_rows = 40\n",
+        )
+        .unwrap();
+        let a = c.hosts.iter().find(|h| h.name == "a").unwrap();
+        let b = c.hosts.iter().find(|h| h.name == "b").unwrap();
+        assert_eq!(a.max_cols, Some(200)); // inherits the global cap
+        assert_eq!(a.max_rows, None); // rows were never capped
+        assert_eq!(b.max_cols, Some(120)); // per-host override
+        assert_eq!(b.max_rows, Some(40));
+    }
+
+    /// A cap of 0 would starve the remote of every column. Treat it as unset,
+    /// the same way an empty remote_bin means "auto" rather than "no binary".
+    #[test]
+    fn a_zero_cap_is_unset_not_a_clamp_to_nothing() {
+        let c = parse_config("[hosts.a]\ntarget = \"a\"\nmax_cols = 0\nmax_rows = 0\n").unwrap();
+        assert_eq!(c.hosts[0].max_cols, None);
+        assert_eq!(c.hosts[0].max_rows, None);
+
+        // and a zeroed per-host value falls back to the global, not to the zero
+        let c = parse_config("max_cols = 200\n[hosts.a]\ntarget = \"a\"\nmax_cols = 0\n").unwrap();
+        assert_eq!(c.hosts[0].max_cols, Some(200));
     }
 
     #[test]
@@ -580,5 +649,23 @@ mod tests {
         let e = load_config(&[a.clone(), b.clone()]).unwrap_err().to_string();
         assert!(e.contains(&a.join("hosts.toml").display().to_string()), "{e}");
         assert!(e.contains(&b.join("hosts.toml").display().to_string()), "{e}");
+    }
+
+    #[test]
+    fn a_zero_cap_warns_instead_of_vanishing() {
+        // silently dropping a typo'd cap leaves the user believing it applied
+        let c = parse_config("max_cols = 0\n[hosts.a]\ntarget = \"a\"\n").unwrap();
+        assert_eq!(c.hosts[0].max_cols, None);
+        assert!(c.warnings.iter().any(|w| w.contains("max_cols = 0 ignored")), "{:?}", c.warnings);
+
+        // and 0 per host is not a way to opt out of a global cap
+        let c =
+            parse_config("max_cols = 200\n[hosts.a]\ntarget = \"a\"\nmax_cols = 0\n").unwrap();
+        assert_eq!(c.hosts[0].max_cols, Some(200), "0 falls through to the global");
+        assert!(
+            c.warnings.iter().any(|w| w.contains("falls through to any global cap")),
+            "{:?}",
+            c.warnings
+        );
     }
 }
