@@ -258,12 +258,20 @@ Mirror panes adapt to what's running on the remote pane:
 
 - at a **shell**, the mouse stays local — drag-select and copy work natively, and
   nothing leaks into the prompt;
-- in a **TUI** (vim, htop, lazygit, …), clicks and wheel forward to the app.
+- at an **agent CLI** (claude, codex, gemini, …), likewise: they're full-screen
+  but never turn mouse reporting on, so selection stays yours;
+- in a **mouse-aware TUI** (vim, htop, lazygit, …), clicks forward to the app.
+
+The wheel is always a semantic scroll of the remote pane, whichever of those it is.
 
 herdr's streamed frames don't carry the app's mouse mode, so the plugin infers it
-from the remote pane's foreground process — anything that isn't a known shell is
-treated as a mouse-aware TUI. Detection is polled, so after switching between a
-shell and a TUI there's a brief lag before the mouse mode catches up.
+from the remote pane's foreground process. Taking the mouse is what stops herdr
+doing native selection, so it is only taken for a process known to want it —
+while the answer is still unknown, selection wins. Detection is polled, so after
+quitting a TUI back to a shell there's a brief lag before the mouse catches up.
+
+If an agent CLI isn't recognised (they ship faster than the built-in list), name
+it in `mouse_local_apps` rather than living without selection in its panes.
 
 ## Configuration
 
@@ -288,6 +296,11 @@ shell and a TUI there's a brief lag before the mouse mode catches up.
 # max_cols / max_rows    # cap the size control asks the remote for, so a
                          # machine with its own display keeps its geometry.
                          # A ceiling only, and never applies to watch-only.
+# mouse_local_apps = ["myagent"]
+                         # extra foreground process names that never enable
+                         # mouse reporting, on top of the built-in shell and
+                         # agent-CLI lists. Naming one here keeps herdr's native
+                         # drag-select working in that program's panes.
 
 [hosts.work]
 target = "work"
@@ -297,6 +310,7 @@ target = "work"
                                      # (`herdr --session project`)
 # max_cols = 212                     # per-host size cap; pairs with
 # max_rows = 58                      # always_control = false
+# mouse_local_apps = ["myagent"]     # added to the global list, not replacing it
 # always_control = false             # per-host override, e.g. a host you use
                                      # directly (don't drive its pane sizes)
 # enabled = true                     # false stops syncing this host without

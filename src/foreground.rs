@@ -3,10 +3,17 @@
 // herdr strips the mouse-mode DECSET from the frames the plugin observes, so the
 // streamer can't tell whether the remote pane's app wants the mouse. As a proxy,
 // query the remote pane's foreground process (`herdr pane process-info`) and
-// classify it: a plain shell at a prompt never enables mouse reporting, so mouse
-// events should stay local (no garbage in the prompt); anything else is treated
-// as a possible mouse-aware TUI and clicks are forwarded. This is a heuristic
-// stand-in until herdr exposes the pane's mouse-reporting state through the API.
+// classify it. This is a heuristic stand-in until herdr exposes the pane's
+// mouse-reporting state through the API.
+//
+// "Is it a TUI?" turned out to be the wrong question. A plain shell at a prompt
+// never enables mouse reporting — but neither does an agent CLI, which is
+// full-screen and so answered "TUI" and got the mouse grabbed on its behalf.
+// Holding the grab is precisely what stops herdr doing native text selection, so
+// in a mirror of an agent host — where nearly every pane is an agent — selection
+// was dead everywhere and the forwarded clicks went to a program that had never
+// asked for them. The question that matters is "does this process want the
+// mouse?", which is answered `false` for two different reasons.
 
 use std::process::Stdio;
 
@@ -23,23 +30,58 @@ const SHELLS: &[&str] = &[
     "pwsh", "powershell", "cmd",
 ];
 
-/// Is `name` one of the known interactive shells? Normalizes a login-shell dash
-/// (`-bash`), a leading path, and a Windows `.exe` suffix before matching.
-pub fn is_shell(name: &str) -> bool {
+/// Agent CLIs: full-screen, but they do not turn mouse reporting on. Same
+/// conclusion as a shell — keep the mouse local — reached for a different reason,
+/// so it is a separate list. Kept lowercase and extension-free; `basename`
+/// normalizes the incoming name before matching.
+const MOUSE_BLIND_TUIS: &[&str] = &[
+    "claude", "codex", "gemini", "cursor-agent", "opencode", "aider", "goose",
+    "crush", "grok", "qwen", "kimi", "amp", "droid", "pi", "antigravity",
+    "hermes",
+];
+
+/// Strip a login-shell dash (`-bash`), any leading path, and a Windows `.exe`
+/// suffix, then lowercase — the form both lists are written in.
+fn basename(name: &str) -> String {
     let base = name.trim_start_matches('-').rsplit(['/', '\\']).next().unwrap_or(name);
-    let n = base.trim_end_matches(".exe").to_ascii_lowercase();
-    SHELLS.contains(&n.as_str())
+    base.trim_end_matches(".exe").to_ascii_lowercase()
 }
 
-/// Classify a `pane process-info` JSON response. `Some(true)` = foreground is a
-/// shell, `Some(false)` = something else, `None` = indeterminate (empty/unparseable).
-pub fn classify(json: &str) -> Option<bool> {
+/// Is `name` one of the known interactive shells?
+pub fn is_shell(name: &str) -> bool {
+    SHELLS.contains(&basename(name).as_str())
+}
+
+/// Does this foreground process enable mouse reporting? `extra` is the per-host
+/// `mouse_local_apps` escape hatch: new agent CLIs appear faster than this list
+/// is updated, and the cost of a miss is a pane you cannot select text in.
+pub fn wants_mouse(name: &str, extra: &[String]) -> bool {
+    let n = basename(name);
+    !SHELLS.contains(&n.as_str())
+        && !MOUSE_BLIND_TUIS.contains(&n.as_str())
+        && !extra.iter().any(|e| basename(e) == n)
+}
+
+/// What the remote foreground implies for local input handling. Two answers, not
+/// one, because they answer different questions: `is_shell` picks the cursor-key
+/// encoding, `wants_mouse` decides the mouse grab. An agent CLI is *not* a shell
+/// — it sets DECCKM, so arrows must stay in application mode — and still doesn't
+/// want the mouse. Collapsing them is the bug this type exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fg {
+    pub is_shell: bool,
+    pub wants_mouse: bool,
+}
+
+/// Classify a `pane process-info` JSON response. `None` = indeterminate
+/// (empty/unparseable), so the caller keeps its last known value.
+pub fn classify(json: &str, extra: &[String]) -> Option<Fg> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
     let fg = v.get("result")?.get("process_info")?.get("foreground_processes")?.as_array()?;
     // the last foreground process is the actually-running leaf, so `sudo vim`
     // classifies on `vim`, not `sudo`
     let name = fg.last()?.get("name")?.as_str()?;
-    Some(is_shell(name))
+    Some(Fg { is_shell: is_shell(name), wants_mouse: wants_mouse(name, extra) })
 }
 
 /// Query the remote pane's foreground process over ssh and classify it. `None`
@@ -51,7 +93,8 @@ pub async fn poll(
     pane: &str,
     ctl_path: Option<&str>,
     container: Option<&crate::pane::ContainerArg>,
-) -> Option<bool> {
+    extra_mouse_local: &[String],
+) -> Option<Fg> {
     // same expression as the observe session (configured path or PATH auto)
     let bin = crate::config::remote_herdr_expr(remote_bin, session);
     let cmd = format!("exec {} pane process-info --pane {}", bin, sh_quote(pane));
@@ -93,7 +136,7 @@ pub async fn poll(
     if !out.status.success() {
         return None;
     }
-    classify(&String::from_utf8_lossy(&out.stdout))
+    classify(&String::from_utf8_lossy(&out.stdout), extra_mouse_local)
 }
 
 #[cfg(test)]
@@ -113,22 +156,51 @@ mod tests {
         assert!(!is_shell("lazygit"));
     }
 
+    fn fg(name: &str) -> String {
+        format!(r#"{{"result":{{"process_info":{{"foreground_processes":[{{"name":"{name}"}}]}}}}}}"#)
+    }
+
     #[test]
     fn classify_reads_leaf_foreground() {
-        let shell = r#"{"result":{"process_info":{"foreground_processes":[{"name":"zsh"}]}}}"#;
-        assert_eq!(classify(shell), Some(true));
-        let tui = r#"{"result":{"process_info":{"foreground_processes":[{"name":"vim"}]}}}"#;
-        assert_eq!(classify(tui), Some(false));
+        assert_eq!(classify(&fg("zsh"), &[]), Some(Fg { is_shell: true, wants_mouse: false }));
+        assert_eq!(classify(&fg("vim"), &[]), Some(Fg { is_shell: false, wants_mouse: true }));
         // sudo wrapper: the leaf is the real program
         let sudo =
             r#"{"result":{"process_info":{"foreground_processes":[{"name":"sudo"},{"name":"vim"}]}}}"#;
-        assert_eq!(classify(sudo), Some(false));
+        assert_eq!(classify(sudo, &[]), Some(Fg { is_shell: false, wants_mouse: true }));
     }
 
     #[test]
     fn classify_indeterminate_on_empty_or_garbage() {
-        assert_eq!(classify(r#"{"result":{"process_info":{"foreground_processes":[]}}}"#), None);
-        assert_eq!(classify("not json"), None);
-        assert_eq!(classify(r#"{"result":{}}"#), None);
+        assert_eq!(classify(r#"{"result":{"process_info":{"foreground_processes":[]}}}"#, &[]), None);
+        assert_eq!(classify("not json", &[]), None);
+        assert_eq!(classify(r#"{"result":{}}"#, &[]), None);
+    }
+
+    #[test]
+    fn an_agent_cli_is_not_a_shell_but_still_does_not_want_the_mouse() {
+        // the whole point: these two answers must be allowed to disagree, or
+        // application cursor keys break when the mouse is fixed (and vice versa)
+        for name in ["claude", "codex", "gemini", "opencode", "cursor-agent"] {
+            let c = classify(&fg(name), &[]).unwrap();
+            assert!(!c.is_shell, "{name} must keep application cursor keys");
+            assert!(!c.wants_mouse, "{name} must leave the mouse to herdr");
+        }
+    }
+
+    #[test]
+    fn a_real_mouse_aware_tui_still_gets_the_mouse() {
+        for name in ["vim", "nvim", "htop", "lazygit", "emacs"] {
+            assert!(wants_mouse(name, &[]), "{name} must still receive clicks");
+        }
+    }
+
+    #[test]
+    fn the_escape_hatch_normalizes_like_the_builtin_lists() {
+        let extra = vec!["MyAgent.exe".to_string(), "/opt/bin/tool".to_string()];
+        assert!(!wants_mouse("myagent", &extra));
+        assert!(!wants_mouse("/usr/local/bin/MyAgent", &extra));
+        assert!(!wants_mouse("tool", &extra));
+        assert!(wants_mouse("unrelated", &extra));
     }
 }

@@ -612,6 +612,7 @@ mod tests {
             session: None,
             max_cols: None,
             max_rows: None,
+            mouse_local_apps: Vec::new(),
             api_transport: ApiTransport::Auto,
             always_control: true,
         }

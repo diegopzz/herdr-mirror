@@ -115,6 +115,11 @@ pub struct HostConfig {
     /// of the local pane blank instead. Observe is unaffected either way.
     pub max_cols: Option<usize>,
     pub max_rows: Option<usize>,
+    /// Extra foreground process names that never enable mouse reporting, added
+    /// to the built-in shell and agent-CLI lists. Agent CLIs ship faster than
+    /// the built-in list is updated, and an unlisted one costs you native
+    /// selection in every pane it runs in — this is the escape hatch.
+    pub mouse_local_apps: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -160,6 +165,7 @@ struct RawConfig {
     always_control: Option<bool>,
     max_cols: Option<usize>,
     max_rows: Option<usize>,
+    mouse_local_apps: Option<Vec<String>>,
     // toml::Table (preserve_order) keeps declaration order — the first host
     // is the remote-create fallback, so order is user-visible
     #[serde(default)]
@@ -181,6 +187,7 @@ struct RawHost {
     always_control: Option<bool>,
     max_cols: Option<usize>,
     max_rows: Option<usize>,
+    mouse_local_apps: Option<Vec<String>>,
     api_transport: Option<String>,
 }
 
@@ -274,6 +281,7 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
     }
     let global_max_cols = size_cap(raw.max_cols);
     let global_max_rows = size_cap(raw.max_rows);
+    let global_mouse_local = raw.mouse_local_apps.unwrap_or_default();
     let mut hosts: Vec<HostConfig> = Vec::new();
     for (name, value) in raw.hosts {
         let h: RawHost = value.try_into().map_err(|e| err(format!("[hosts.{name}]: {e}")))?;
@@ -320,6 +328,14 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
             always_control: h.always_control.unwrap_or(global_always_control),
             max_cols: size_cap(h.max_cols).or(global_max_cols),
             max_rows: size_cap(h.max_rows).or(global_max_rows),
+            // union, not override: the global list is "agents I run everywhere"
+            // and the per-host one is "and this box also runs these" — a host
+            // that names one extra agent should not lose the global set
+            mouse_local_apps: global_mouse_local
+                .iter()
+                .cloned()
+                .chain(h.mouse_local_apps.unwrap_or_default())
+                .collect(),
             docker_bin: h.docker_bin.unwrap_or_else(|| "docker".into()),
             api_transport,
             kind,
@@ -410,6 +426,25 @@ mod tests {
         assert_eq!(a.max_rows, None); // rows were never capped
         assert_eq!(b.max_cols, Some(120)); // per-host override
         assert_eq!(b.max_rows, Some(40));
+    }
+
+    #[test]
+    fn mouse_local_apps_union_global_and_per_host() {
+        // unset anywhere: empty, so the built-in shell/agent lists are the whole policy
+        let c = parse_config("[hosts.a]\ntarget = \"a\"\n").unwrap();
+        assert!(c.hosts[0].mouse_local_apps.is_empty());
+
+        let c = parse_config(
+            "mouse_local_apps = [\"everywhere\"]\n\
+             [hosts.a]\ntarget = \"a\"\n\
+             [hosts.b]\ntarget = \"b\"\nmouse_local_apps = [\"justhere\"]\n",
+        )
+        .unwrap();
+        let a = c.hosts.iter().find(|h| h.name == "a").unwrap();
+        let b = c.hosts.iter().find(|h| h.name == "b").unwrap();
+        assert_eq!(a.mouse_local_apps, vec!["everywhere"]);
+        // union, not override — naming one extra agent must not drop the global set
+        assert_eq!(b.mouse_local_apps, vec!["everywhere", "justhere"]);
     }
 
     /// A cap of 0 would starve the remote of every column. Treat it as unset,

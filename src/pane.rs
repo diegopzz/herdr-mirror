@@ -75,6 +75,10 @@ pub struct Args {
     pub ctl_path: Option<String>,
     /// container to exec into instead of ssh. `None` = ssh host.
     pub container: Option<ContainerArg>,
+    /// extra foreground process names to treat as not wanting the mouse, on top
+    /// of the built-in shell and agent-CLI lists. Set by the daemon from
+    /// per-host config; see `foreground::wants_mouse`.
+    pub mouse_local: Vec<String>,
 }
 
 /// How the pane process should reach its container. The daemon passes a *ref*,
@@ -101,6 +105,7 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
         max_rows: None,
         ctl_path: None,
         container: None,
+        mouse_local: Vec::new(),
     };
     let mut container_name: Option<String> = None;
     let mut container_folder: Option<String> = None;
@@ -137,6 +142,15 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
                 args.max_rows = Some(next("--max-rows")?.parse().map_err(|_| err("--max-rows must be a number"))?)
                     .filter(|&n| n > 0)
             }
+            // repeatable and comma-separated both work, so a host with one extra
+            // agent doesn't need different syntax from a host with six
+            "--mouse-local" => args.mouse_local.extend(
+                next("--mouse-local")?
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string),
+            ),
             "--ctl-path" => args.ctl_path = Some(next("--ctl-path")?),
             "--container" => container_name = Some(next("--container")?),
             "--container-folder" => container_folder = Some(next("--container-folder")?),
@@ -202,7 +216,7 @@ enum Msg {
     Stdin(Vec<u8>),
     /// result of a background foreground-process poll: Some(true)=shell,
     /// Some(false)=TUI, None=poll failed (keep last value)
-    Foreground(Option<bool>),
+    Foreground(Option<crate::foreground::Fg>),
     Paste(crate::paste::Outcome),
     Drop(crate::paste::DropResult),
 }
@@ -463,21 +477,26 @@ enum MouseAction {
     Scroll { up: bool },
     /// click/drag on a remote TUI: forward the raw SGR sequence
     ForwardRaw,
-    /// click/drag at a shell (or unclassified): drop, keep mouse local
+    /// click/drag at a process that never asked for the mouse: drop, keep it local
     Drop,
 }
 
 /// Wheel always scrolls semantically, regardless of the foreground
 /// classification — the remote herdr server knows the real app's mouse mode
 /// and is a better judge than this side's process-name heuristic (e.g. a TUI
-/// that doesn't consume wheel events, like an agent CLI). Non-wheel
-/// clicks/drags keep the existing foreground-based routing.
-fn mouse_action(remote_is_shell: Option<bool>, btn: u32, press: bool) -> MouseAction {
+/// that doesn't consume wheel events, like an agent CLI).
+///
+/// Clicks and drags forward only when the foreground is *known* to want the
+/// mouse. Unknown drops: sending SGR bytes to a program that never enabled
+/// reporting types garbage into it, and the grab that makes forwarding possible
+/// is the same grab that takes native selection away from herdr — so the
+/// uncertain case should cost the click, not the selection.
+fn mouse_action(remote_wants_mouse: Option<bool>, btn: u32, press: bool) -> MouseAction {
     if press && (btn == 64 || btn == 65) {
         MouseAction::Scroll { up: btn == 64 }
     } else if btn == 66 || btn == 67 {
         MouseAction::Drop
-    } else if remote_is_shell == Some(false) {
+    } else if remote_wants_mouse == Some(true) {
         MouseAction::ForwardRaw
     } else {
         MouseAction::Drop
@@ -660,10 +679,17 @@ struct App {
     hint_clear_at: Option<Instant>,
     /// predictive local echo — draws keystrokes optimistically, frame-verified
     predict: Predictor,
-    /// remote pane foreground: Some(true)=shell (keep mouse local, no garbage),
-    /// Some(false)=TUI (forward clicks), None=unknown (fail safe to local).
-    /// Refreshed lazily on mouse activity via `herdr pane process-info`.
+    /// remote pane foreground is a plain shell. Drives the cursor-key encoding
+    /// only — an agent CLI is not a shell but still wants application mode.
+    /// Refreshed lazily on input via `herdr pane process-info`.
     remote_is_shell: Option<bool>,
+    /// remote pane foreground has mouse reporting on: `Some(true)` = forward
+    /// clicks, `Some(false)` = leave the mouse to herdr, `None` = not yet known
+    /// (treated as "leave it to herdr", so selection works before the first poll
+    /// lands rather than after the user has typed something).
+    remote_wants_mouse: Option<bool>,
+    /// frame-driven classification attempts spent so far (see `handle_frame`)
+    frame_fg_polls: u8,
     /// last time a foreground poll was kicked off (throttles the ssh handshakes)
     fg_poll_at: Option<Instant>,
     /// scheduled delayed re-poll to catch a foreground change the last input just
@@ -693,6 +719,11 @@ const FG_POLL_INTERVAL: Duration = Duration::from_millis(1500);
 /// after input settles, re-poll once this much later to catch a foreground
 /// change the input caused (e.g. a TUI just exited); bypasses FG_POLL_INTERVAL
 const SETTLE_DELAY: Duration = Duration::from_millis(350);
+
+/// how many frame-driven classification attempts a pane gets before it falls
+/// back to polling only on input. Enough to ride out a slow first connect,
+/// small enough that a pane which can never be classified stops paying for it.
+const MAX_FRAME_FG_POLLS: u8 = 3;
 
 impl App {
     fn paint(&mut self) {
@@ -749,6 +780,7 @@ impl App {
         let pane = self.args.pane_target.clone();
         let ctl = self.args.ctl_path.clone();
         let container = self.args.container.clone();
+        let mouse_local = self.args.mouse_local.clone();
         tokio::spawn(async move {
             let v = crate::foreground::poll(
                 &ssh,
@@ -757,21 +789,22 @@ impl App {
                 &pane,
                 ctl.as_deref(),
                 container.as_ref(),
+                &mouse_local,
             )
             .await;
             let _ = tx.send(Msg::Foreground(v)).await;
         });
     }
 
-    /// Match the local mouse grab to the classification: release it at a shell so
-    /// herdr does native selection/scroll, keep it grabbed for a TUI (or while
-    /// unknown) so clicks can be forwarded. Only writes on a change.
+    /// Match the local mouse grab to the classification: hold it only for a
+    /// foreground known to want the mouse, so herdr keeps native selection
+    /// everywhere else. Only writes on a change.
     fn sync_mouse_grab(&mut self) {
         if !self.tty {
             return;
         }
-        // grab unless we've confirmed the foreground is a shell
-        let want = self.remote_is_shell != Some(true);
+        // grab only once we've confirmed the foreground wants the mouse
+        let want = self.remote_wants_mouse == Some(true);
         if want == self.mouse_grabbed {
             return;
         }
@@ -936,6 +969,22 @@ impl App {
         let Some(bytes) = &frame.bytes else { return };
         self.backoff_idx = 0;
         self.renderer.status("");
+        // First frame proves the remote pane is live, which is the earliest we
+        // can usefully ask what is running in it. Polling here rather than
+        // waiting for input is what makes the mouse correct in a pane you only
+        // ever look at — a mirror is full of those, and the old lazy poll left
+        // them unclassified until something was typed.
+        //
+        // Bounded, because `poll` returns None on any failure and a failure
+        // leaves us unclassified: an unbounded "retry while unknown" would spawn
+        // an ssh handshake every FG_POLL_INTERVAL forever in a pane whose
+        // process-info never resolves, times every pane on the host. After the
+        // budget it falls back to the old input-driven path, which costs nothing
+        // in a pane nobody touches.
+        if self.remote_wants_mouse.is_none() && self.frame_fg_polls < MAX_FRAME_FG_POLLS {
+            self.frame_fg_polls += 1;
+            self.spawn_foreground_poll(false);
+        }
         self.grid
             .resize(frame.width.unwrap_or(self.grid.width), frame.height.unwrap_or(self.grid.height));
         if frame.full == Some(true) {
@@ -1167,7 +1216,7 @@ impl App {
         let mut scrolls: Vec<serde_json::Value> = Vec::new();
         while i < buf.len() {
             if let Some((btn, x, y, press, len)) = parse_mouse(&buf, i) {
-                match mouse_action(self.remote_is_shell, btn, press) {
+                match mouse_action(self.remote_wants_mouse, btn, press) {
                     MouseAction::Scroll { up } => {
                         scrolls.push(json!({
                             "type": "terminal.scroll",
@@ -1264,13 +1313,19 @@ pub async fn run(args: Args) -> Result<()> {
 
     let tty = !args.dump && unsafe { libc::isatty(libc::STDOUT_FILENO) } == 1;
     let raw = if tty {
-        // 1002/1006: button-event mouse tracking with SGR encoding, so wheel and
-        // clicks reach us instead of scrolling the hosting pane's scrollback
+        // No mouse grab here, deliberately. Grabbing (1002/1006) is what lets us
+        // turn the wheel into a semantic scroll and forward clicks — but it is
+        // the same act that takes native selection away from herdr, and until
+        // the first foreground poll lands we do not know which the remote needs.
+        // Starting ungrabbed makes the ordinary case — select some text in a
+        // pane you just opened — work straight away; `sync_mouse_grab` takes the
+        // mouse the moment a genuinely mouse-aware TUI is identified.
+        //
         // 2004 (bracketed paste) is asked for purely to get framing: herdr
         // only wraps a paste when the pane's app has enabled it, and a file
         // drop otherwise arrives as bare text with no terminator at all. See
         // `intercept_paste`; the markers never reach the remote.
-        write_stdout("\x1b[?1049h\x1b[2J\x1b[H\x1b[?1002h\x1b[?1006h\x1b[?2004h");
+        write_stdout("\x1b[?1049h\x1b[2J\x1b[H\x1b[?2004h");
         RawMode::enable()
     } else {
         None
@@ -1317,9 +1372,11 @@ pub async fn run(args: Args) -> Result<()> {
         hint_clear_at: None,
         predict: Predictor::new(),
         remote_is_shell: None,
+        remote_wants_mouse: None,
+        frame_fg_polls: 0,
         fg_poll_at: None,
         settle_at: None,
-        mouse_grabbed: tty, // startup wrote ?1002h when we're a tty
+        mouse_grabbed: false, // startup no longer grabs; see the ?1049h write
         // startup leaves the pane in normal cursor mode; the first classification
         // moves it if the remote turns out to be a TUI
         app_cursor_keys: false,
@@ -1380,8 +1437,9 @@ pub async fn run(args: Args) -> Result<()> {
                     Some(Msg::SessionExit { gen, mode, reason, uptime }) => app.handle_exit(gen, mode, reason, uptime),
                     Some(Msg::Stdin(buf)) => app.handle_stdin(buf).await,
                     // keep the last good classification if a poll failed (None)
-                    Some(Msg::Foreground(v)) => if v.is_some() {
-                        app.remote_is_shell = v;
+                    Some(Msg::Foreground(v)) => if let Some(fg) = v {
+                        app.remote_is_shell = Some(fg.is_shell);
+                        app.remote_wants_mouse = Some(fg.wants_mouse);
                         app.sync_mouse_grab();
                         app.sync_cursor_key_mode();
                     },
@@ -1491,19 +1549,25 @@ mod tests {
     }
 
     #[test]
-    fn wheel_always_semantic_scroll_even_on_tui_foreground() {
-        // remote foreground classified as a TUI (e.g. `claude`) — wheel must
-        // still produce a semantic scroll, not a raw forward, or it silently
-        // does nothing when the TUI doesn't consume mouse wheel input
-        assert_eq!(mouse_action(Some(false), 64, true), MouseAction::Scroll { up: true });
-        assert_eq!(mouse_action(Some(false), 65, true), MouseAction::Scroll { up: false });
-        // unclassified/shell foreground: wheel still scrolls
-        assert_eq!(mouse_action(None, 64, true), MouseAction::Scroll { up: true });
-        assert_eq!(mouse_action(Some(true), 65, true), MouseAction::Scroll { up: false });
-        // non-wheel clicks/drags keep the existing foreground-based routing
-        assert_eq!(mouse_action(Some(false), 0, true), MouseAction::ForwardRaw); // TUI click
-        assert_eq!(mouse_action(Some(true), 0, true), MouseAction::Drop); // shell click
-        assert_eq!(mouse_action(None, 0, true), MouseAction::Drop); // unclassified click
+    fn wheel_is_always_a_semantic_scroll_whatever_the_foreground() {
+        // wheel must produce a semantic scroll rather than a raw forward, or it
+        // silently does nothing when the app doesn't consume wheel input
+        for who in [Some(true), Some(false), None] {
+            assert_eq!(mouse_action(who, 64, true), MouseAction::Scroll { up: true });
+            assert_eq!(mouse_action(who, 65, true), MouseAction::Scroll { up: false });
+        }
+    }
+
+    #[test]
+    fn clicks_forward_only_to_a_foreground_that_asked_for_them() {
+        // a real mouse-aware TUI (vim, htop) gets the click
+        assert_eq!(mouse_action(Some(true), 0, true), MouseAction::ForwardRaw);
+        // a shell or an agent CLI does not: forwarding types SGR garbage into a
+        // program that never enabled reporting, and holding the grab needed to
+        // forward is what costs herdr its native selection
+        assert_eq!(mouse_action(Some(false), 0, true), MouseAction::Drop);
+        // and while we still don't know, the click is the cheaper thing to lose
+        assert_eq!(mouse_action(None, 0, true), MouseAction::Drop);
     }
 
     #[test]
@@ -1561,6 +1625,24 @@ mod tests {
         let argv: Vec<String> =
             ["h", "w1:p1", "--max-cols", "212"].iter().map(|s| s.to_string()).collect();
         assert_eq!(parse_args(&argv).unwrap().max_cols, Some(212));
+    }
+
+    #[test]
+    fn mouse_local_accepts_commas_and_repeats() {
+        // a host with one extra agent shouldn't need different syntax from a
+        // host with six, so both spellings work and accumulate
+        let argv: Vec<String> = [
+            "h", "w1:p1", "--mouse-local", "myagent, other ", "--mouse-local", "third",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let a = parse_args(&argv).unwrap();
+        assert_eq!(a.mouse_local, vec!["myagent", "other", "third"]);
+
+        // unset stays empty, so the built-in lists are the whole policy
+        let argv: Vec<String> = ["h", "w1:p1"].iter().map(|s| s.to_string()).collect();
+        assert!(parse_args(&argv).unwrap().mouse_local.is_empty());
     }
 
     #[test]

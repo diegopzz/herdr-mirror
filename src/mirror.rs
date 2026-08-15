@@ -358,6 +358,7 @@ pub(crate) fn cmd_for_pane(
     let always_control = host.always_control;
     let max_cols = host.max_cols;
     let max_rows = host.max_rows;
+    let mouse_local = host.mouse_local_apps.clone();
     let kind = host.kind.clone();
     let docker_bin = host.docker_bin.clone();
     // daemon's ControlMaster socket for this host (see remote.rs); the streamer
@@ -390,6 +391,11 @@ pub(crate) fn cmd_for_pane(
         }
         if let Some(r) = max_rows {
             argv.extend(["--max-rows".into(), r.to_string()]);
+        }
+        // one comma-joined flag rather than one per name, so a host with a long
+        // list doesn't blow up the argv the daemon has to match on when healing
+        if !mouse_local.is_empty() {
+            argv.extend(["--mouse-local".into(), mouse_local.join(",")]);
         }
         // ssh only: the pane reuses the daemon's ControlMaster for cheap
         // foreground polls. Docker has no ControlMaster, and healing no longer
@@ -1528,6 +1534,7 @@ mod tests {
             always_control: true,
             max_cols: None,
             max_rows: None,
+            mouse_local_apps: Vec::new(),
             api_transport: crate::config::ApiTransport::Auto,
         }
     }
@@ -1761,6 +1768,19 @@ mod tests {
         // still whatever --cols/--rows said (here: unset, so the defaults,
         // which #42 made a floor rather than an exact size)
         assert_eq!((parsed.cols, parsed.rows), (240, 72));
+    }
+
+    #[test]
+    fn mouse_local_apps_reach_the_streamer_argv() {
+        let mut host = ssh_host();
+        let bare = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new())("w1:p1");
+        // an unconfigured host's argv is unchanged, so the built-in lists stand alone
+        assert!(!bare.iter().any(|a| a == "--mouse-local"));
+
+        host.mouse_local_apps = vec!["myagent".into(), "other".into()];
+        let argv = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new())("w1:p1");
+        let parsed = crate::pane::parse_args(&argv[2..]).expect("pane must parse daemon argv");
+        assert_eq!(parsed.mouse_local, vec!["myagent", "other"]);
     }
 
     #[test]
