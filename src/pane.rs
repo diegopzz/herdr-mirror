@@ -516,17 +516,18 @@ fn mouse_action(
     }
 }
 
-/// herdr's alternate-scroll emulation, recognized after the fact. With the
-/// mouse grab released (the price of native selection), the local herdr owns
-/// the wheel again — and for an alternate-screen pane it synthesizes
-/// `mouse_scroll_lines` identical arrow keys per notch, written as ONE chunk.
-/// Typed into an agent CLI those arrows cycle its composer history: a wheel
-/// flick rewrites what the user was about to send. A chunk that is NOTHING
-/// BUT >=3 identical arrows is that emulation — a human keypress arrives one
-/// arrow per chunk, autorepeat one per event, and a bracketed paste carries
-/// its `ESC[200~` prefix — so it is safe to take the burst back and route it
-/// as the wheel it really was. Returns (up, arrow_count).
-fn whole_chunk_arrow_burst(bytes: &[u8]) -> Option<(bool, usize)> {
+/// A chunk that is NOTHING BUT identical arrow-key sequences — the raw
+/// material of herdr's alternate-scroll emulation. With the mouse grab
+/// released (the price of native selection), the local herdr owns the wheel
+/// again, and for an alternate-screen pane it synthesizes
+/// `mouse_scroll_lines` identical arrows per notch. Typed into an agent CLI
+/// those arrows cycle its composer history: a wheel flick rewrites what the
+/// user was about to send. The emulation's writes may reach us as one chunk
+/// or one arrow at a time, so recognition is an ACCUMULATOR (`ArrowHold` on
+/// App): this function only reports "this chunk is purely N identical
+/// arrows". A bracketed paste never matches — its `ESC[200~` prefix is not
+/// an arrow. Returns (up, arrow_count, the 3-byte sequence).
+fn whole_chunk_arrows(bytes: &[u8]) -> Option<(bool, usize, [u8; 3])> {
     fn arrow_at(b: &[u8], i: usize) -> Option<bool> {
         (b.len() >= i + 3
             && b[i] == 0x1b
@@ -535,7 +536,7 @@ fn whole_chunk_arrow_burst(bytes: &[u8]) -> Option<(bool, usize)> {
             .then(|| b[i + 2] == b'A')
     }
     let up = arrow_at(bytes, 0)?;
-    if !bytes.len().is_multiple_of(3) {
+    if bytes.len() < 3 || !bytes.len().is_multiple_of(3) {
         return None;
     }
     let n = bytes.len() / 3;
@@ -544,8 +545,23 @@ fn whole_chunk_arrow_burst(bytes: &[u8]) -> Option<(bool, usize)> {
             return None;
         }
     }
-    (n >= 3).then_some((up, n))
+    Some((up, n, [bytes[0], bytes[1], bytes[2]]))
 }
+
+/// Arrows held back while we decide whether they are a wheel notch. Reaching
+/// [`WHEEL_ARROWS`] inside the hold window is the emulation — no human
+/// presses the same arrow three times in 35ms, and autorepeat delivers one
+/// event at a time, far slower. Anything less flushes to the remote as the
+/// keystrokes they were, delayed imperceptibly.
+struct ArrowHold {
+    up: bool,
+    seq: [u8; 3],
+    count: usize,
+    flush_at: Instant,
+}
+
+const ARROW_HOLD_WINDOW: Duration = Duration::from_millis(35);
+const WHEEL_ARROWS: usize = 3; // herdr's mouse_scroll_lines default
 
 fn contains_wheel_press(bytes: &[u8]) -> bool {
     let mut i = 0;
@@ -732,6 +748,9 @@ struct App {
     /// (treated as "leave it to herdr", so selection works before the first poll
     /// lands rather than after the user has typed something).
     remote_wants_mouse: Option<bool>,
+    /// arrows held while deciding whether they are a wheel notch (alternate-
+    /// scroll emulation) or real keystrokes; flushed on window expiry
+    arrow_hold: Option<ArrowHold>,
     /// frame-driven classification attempts spent so far (see `handle_frame`)
     frame_fg_polls: u8,
     /// last time a foreground poll was kicked off (throttles the ssh handshakes)
@@ -1252,36 +1271,34 @@ impl App {
         // and re-check shortly after input settles, to catch a change the input
         // just caused (e.g. `:q` quitting vim — the poll above still sees vim)
         self.settle_at = Some(Instant::now() + SETTLE_DELAY);
-        // A pure burst of identical arrows is the local herdr's wheel
-        // emulation (see whole_chunk_arrow_burst) — take it back and scroll:
-        // a shell's scrollback moves semantically; a mouse-blind TUI (agent
-        // CLI) gets the wheel re-materialized as SGR, which it consumes as
-        // chat-view scrolling instead of having its composer history cycled.
-        // Unknown or mouse-wanting foregrounds pass through untouched.
-        if let Some((up, arrows)) = whole_chunk_arrow_burst(&buf) {
-            match (self.remote_is_shell, self.remote_wants_mouse) {
-                (Some(true), _) => {
-                    self.send(json!({
-                        "type": "terminal.scroll",
-                        "direction": if up { "up" } else { "down" },
-                        "lines": arrows,
-                        "source": "wheel",
-                        "column": 0,
-                        "row": 0,
-                        "modifiers": 0,
-                    }))
-                    .await;
-                    return;
+        // Arrow chunks feed the wheel accumulator (see ArrowHold): herdr's
+        // alternate-scroll emulation may arrive one arrow per chunk, so a
+        // lone arrow is held ~35ms; three identical ones inside the window
+        // are a wheel notch. Only when the grab is released (that is the only
+        // time herdr synthesizes arrows) and never mid-decision for a
+        // mouse-wanting foreground.
+        if self.remote_wants_mouse != Some(true) {
+            if let Some((up, n, seq)) = whole_chunk_arrows(&buf) {
+                match &mut self.arrow_hold {
+                    Some(h) if h.up == up => h.count += n,
+                    _ => {
+                        self.flush_arrow_hold().await;
+                        self.arrow_hold = Some(ArrowHold {
+                            up,
+                            seq,
+                            count: n,
+                            flush_at: Instant::now() + ARROW_HOLD_WINDOW,
+                        });
+                    }
                 }
-                (Some(false), Some(false)) => {
-                    let sgr: &[u8] = if up { b"\x1b[<64;1;1M" } else { b"\x1b[<65;1;1M" };
-                    let bytes: Vec<u8> = sgr.repeat(arrows.div_ceil(3));
-                    self.send(json!({ "type": "terminal.input", "bytes": B64.encode(&bytes) }))
-                        .await;
-                    return;
+                if self.arrow_hold.as_ref().is_some_and(|h| h.count >= WHEEL_ARROWS) {
+                    let h = self.arrow_hold.take().unwrap();
+                    self.emit_wheel(h.up, h.count).await;
                 }
-                _ => {}
+                return;
             }
+            // anything else flushes held arrows first, keeping input order
+            self.flush_arrow_hold().await;
         }
         // wheel becomes a semantic scroll (server decides app vs scrollback);
         // clicks/drags forward to the remote pty only when the foreground is a
@@ -1322,6 +1339,43 @@ impl App {
             if self.predict.on_input(&rest, &self.grid) {
                 self.paint();
             }
+        }
+    }
+
+    /// Held arrows turned out to be keystrokes — forward them unchanged.
+    async fn flush_arrow_hold(&mut self) {
+        if let Some(h) = self.arrow_hold.take() {
+            let bytes: Vec<u8> = h.seq.repeat(h.count);
+            self.send(json!({ "type": "terminal.input", "bytes": B64.encode(&bytes) })).await;
+        }
+    }
+
+    /// A recognized wheel notch, routed by foreground: a shell's remote
+    /// scrollback scrolls semantically; a mouse-blind TUI (agent CLI) gets
+    /// the wheel re-materialized as SGR, which it consumes as chat-view
+    /// scrolling instead of having its composer history cycled; an unknown
+    /// foreground drops it — the uncertain case should cost the scroll, not
+    /// type junk into whatever is there.
+    async fn emit_wheel(&mut self, up: bool, arrows: usize) {
+        match self.remote_is_shell {
+            Some(true) => {
+                self.send(json!({
+                    "type": "terminal.scroll",
+                    "direction": if up { "up" } else { "down" },
+                    "lines": arrows,
+                    "source": "wheel",
+                    "column": 0,
+                    "row": 0,
+                    "modifiers": 0,
+                }))
+                .await;
+            }
+            Some(false) => {
+                let sgr: &[u8] = if up { b"\x1b[<64;1;1M" } else { b"\x1b[<65;1;1M" };
+                let bytes: Vec<u8> = sgr.repeat(arrows.div_ceil(WHEEL_ARROWS));
+                self.send(json!({ "type": "terminal.input", "bytes": B64.encode(&bytes) })).await;
+            }
+            None => {}
         }
     }
 
@@ -1448,6 +1502,7 @@ pub async fn run(args: Args) -> Result<()> {
         predict: Predictor::new(),
         remote_is_shell: None,
         remote_wants_mouse: None,
+        arrow_hold: None,
         frame_fg_polls: 0,
         fg_poll_at: None,
         settle_at: None,
@@ -1502,6 +1557,7 @@ pub async fn run(args: Args) -> Result<()> {
             idle_at,
             app.predict.deadline(),
             app.settle_at,
+            app.arrow_hold.as_ref().map(|h| h.flush_at),
         ]);
 
         tokio::select! {
@@ -1570,6 +1626,10 @@ pub async fn run(args: Args) -> Result<()> {
                 if app.settle_at.is_some_and(|t| t <= now) {
                     app.settle_at = None;
                     app.spawn_foreground_poll(true); // forced: bypass the throttle
+                }
+                if app.arrow_hold.as_ref().is_some_and(|h| h.flush_at <= now) {
+                    // window expired below the wheel threshold: keystrokes
+                    app.flush_arrow_hold().await;
                 }
                 if app.predict.deadline().is_some_and(|t| t <= now) {
                     app.predict.on_tick(); // wipe timed-out ghosts (no-echo prompts)
@@ -1656,22 +1716,24 @@ mod tests {
     }
 
     #[test]
-    fn arrow_bursts_are_recognized_and_human_input_is_not() {
-        // herdr's wheel emulation: 3 identical arrows in one chunk
-        assert_eq!(whole_chunk_arrow_burst(b"\x1b[A\x1b[A\x1b[A"), Some((true, 3)));
-        assert_eq!(whole_chunk_arrow_burst(b"\x1b[B\x1b[B\x1b[B"), Some((false, 3)));
+    fn arrow_chunks_are_recognized_and_anything_else_is_not() {
+        // pure arrow chunks report their count — one per chunk (how the
+        // emulation often arrives) up to whole coalesced notches
+        assert_eq!(whole_chunk_arrows(b"\x1b[A"), Some((true, 1, *b"\x1b[A")));
+        assert_eq!(whole_chunk_arrows(b"\x1b[A\x1b[A\x1b[A"), Some((true, 3, *b"\x1b[A")));
+        assert_eq!(whole_chunk_arrows(b"\x1b[B\x1b[B\x1b[B"), Some((false, 3, *b"\x1b[B")));
         // application cursor keys mode
-        assert_eq!(whole_chunk_arrow_burst(b"\x1bOA\x1bOA\x1bOA"), Some((true, 3)));
+        assert_eq!(whole_chunk_arrows(b"\x1bOA\x1bOA\x1bOA"), Some((true, 3, *b"\x1bOA")));
         // two coalesced notches
-        assert_eq!(whole_chunk_arrow_burst(&b"\x1b[A".repeat(6)), Some((true, 6)));
-        // a single keypress is never a burst
-        assert_eq!(whole_chunk_arrow_burst(b"\x1b[A"), None);
-        assert_eq!(whole_chunk_arrow_burst(b"\x1b[A\x1b[A"), None);
+        assert_eq!(whole_chunk_arrows(&b"\x1b[A".repeat(6)), Some((true, 6, *b"\x1b[A")));
         // mixed directions or trailing bytes: not the emulation's shape
-        assert_eq!(whole_chunk_arrow_burst(b"\x1b[A\x1b[A\x1b[B"), None);
-        assert_eq!(whole_chunk_arrow_burst(b"\x1b[A\x1b[A\x1b[Ax"), None);
+        assert_eq!(whole_chunk_arrows(b"\x1b[A\x1b[A\x1b[B"), None);
+        assert_eq!(whole_chunk_arrows(b"\x1b[A\x1b[A\x1b[Ax"), None);
         // a bracketed paste of arrows keeps its prefix, so it never matches
-        assert_eq!(whole_chunk_arrow_burst(b"\x1b[200~\x1b[A\x1b[A\x1b[A\x1b[201~"), None);
+        assert_eq!(whole_chunk_arrows(b"\x1b[200~\x1b[A\x1b[A\x1b[A\x1b[201~"), None);
+        // plain typing is untouched
+        assert_eq!(whole_chunk_arrows(b"hello"), None);
+        assert_eq!(whole_chunk_arrows(b"\x1b[C"), None); // right arrow: not a scroll
     }
 
     #[test]
