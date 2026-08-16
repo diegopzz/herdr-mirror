@@ -1221,6 +1221,45 @@ impl App {
             });
             return;
         }
+        // The arrow accumulator guards BOTH modes: herdr's alternate-scroll
+        // emulation (the grab is released, so a wheel arrives as synthesized
+        // arrows) hits the observe branch below as "any keystroke", where it
+        // would escalate to control and cycle an agent CLI's prompt history.
+        // Hold pure-arrow chunks; a notch inside the window is a wheel and is
+        // routed (full control) or treated like the stray SGR wheel below
+        // (observe: never grab the remote's lock for a glance-scroll);
+        // anything less flushes as the keystrokes it was.
+        if self.remote_wants_mouse != Some(true) {
+            if let Some((up, n, seq)) = whole_chunk_arrows(&buf) {
+                match &mut self.arrow_hold {
+                    Some(h) if h.up == up => h.count += n,
+                    _ => {
+                        self.flush_arrow_hold().await;
+                        self.arrow_hold = Some(ArrowHold {
+                            up,
+                            seq,
+                            count: n,
+                            flush_at: Instant::now() + ARROW_HOLD_WINDOW,
+                        });
+                    }
+                }
+                if self.arrow_hold.as_ref().is_some_and(|h| h.count >= WHEEL_ARROWS) {
+                    let h = self.arrow_hold.take().unwrap();
+                    if self.in_full_control() {
+                        self.last_input = Instant::now();
+                        self.emit_wheel(h.up, h.count).await;
+                    } else if self.control_sticky {
+                        self.control_sticky = false;
+                        self.switch_mode(Mode::Control);
+                    } else if self.mode == Mode::Observe {
+                        self.hint("read-only — type to take control");
+                    }
+                }
+                return;
+            }
+            // any other input first flushes held arrows, keeping their order
+            self.flush_arrow_hold().await;
+        }
         if self.mode == Mode::Observe || self.switching_to == Some(Mode::Observe) {
             // no quit key: the wrapper's lifecycle belongs to the hosting pane
             if has_mouse_seq(&buf) {
@@ -1271,35 +1310,6 @@ impl App {
         // and re-check shortly after input settles, to catch a change the input
         // just caused (e.g. `:q` quitting vim — the poll above still sees vim)
         self.settle_at = Some(Instant::now() + SETTLE_DELAY);
-        // Arrow chunks feed the wheel accumulator (see ArrowHold): herdr's
-        // alternate-scroll emulation may arrive one arrow per chunk, so a
-        // lone arrow is held ~35ms; three identical ones inside the window
-        // are a wheel notch. Only when the grab is released (that is the only
-        // time herdr synthesizes arrows) and never mid-decision for a
-        // mouse-wanting foreground.
-        if self.remote_wants_mouse != Some(true) {
-            if let Some((up, n, seq)) = whole_chunk_arrows(&buf) {
-                match &mut self.arrow_hold {
-                    Some(h) if h.up == up => h.count += n,
-                    _ => {
-                        self.flush_arrow_hold().await;
-                        self.arrow_hold = Some(ArrowHold {
-                            up,
-                            seq,
-                            count: n,
-                            flush_at: Instant::now() + ARROW_HOLD_WINDOW,
-                        });
-                    }
-                }
-                if self.arrow_hold.as_ref().is_some_and(|h| h.count >= WHEEL_ARROWS) {
-                    let h = self.arrow_hold.take().unwrap();
-                    self.emit_wheel(h.up, h.count).await;
-                }
-                return;
-            }
-            // anything else flushes held arrows first, keeping input order
-            self.flush_arrow_hold().await;
-        }
         // wheel becomes a semantic scroll (server decides app vs scrollback);
         // clicks/drags forward to the remote pty only when the foreground is a
         // TUI — at a shell they're dropped so they don't garbage the prompt
@@ -1342,11 +1352,27 @@ impl App {
         }
     }
 
-    /// Held arrows turned out to be keystrokes — forward them unchanged.
+    /// In control with a live session — the only state where input can be
+    /// sent directly rather than queued.
+    fn in_full_control(&self) -> bool {
+        self.mode == Mode::Control && self.switching_to.is_none() && self.session.is_some()
+    }
+
+    /// Held arrows turned out to be keystrokes — deliver them the way the
+    /// mode they arrived in would have: sent directly under full control,
+    /// queued (and escalating, exactly like any typed key) otherwise.
     async fn flush_arrow_hold(&mut self) {
         if let Some(h) = self.arrow_hold.take() {
             let bytes: Vec<u8> = h.seq.repeat(h.count);
-            self.send(json!({ "type": "terminal.input", "bytes": B64.encode(&bytes) })).await;
+            if self.in_full_control() {
+                self.send(json!({ "type": "terminal.input", "bytes": B64.encode(&bytes) })).await;
+            } else {
+                self.control_sticky = false;
+                self.pending_input.push(bytes);
+                if self.mode == Mode::Observe || self.switching_to == Some(Mode::Observe) {
+                    self.switch_mode(Mode::Control);
+                }
+            }
         }
     }
 
