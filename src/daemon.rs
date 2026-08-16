@@ -68,7 +68,7 @@ struct HostCtx {
     host: HostConfig,
     local: ApiClient,
     log: Logger,
-    close_remote_on_local_close: bool,
+    close_remote_on_local_close: crate::config::CloseThrough,
     closes: crate::closes::Closes,
 }
 

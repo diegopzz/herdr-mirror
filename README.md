@@ -303,10 +303,14 @@ dropped files need nothing). Uploads aren't cleaned up; `rm -rf
 # default_host = "work"  # host that "new remote workspace" targets when
                          # invoked outside any mirror (default: first host)
 # close_remote_on_local_close = true
-                         # default. Closing a mirror pane/tab/workspace
-                         # locally (e.g. prefix+x) also closes it on the
-                         # remote. Set false to only stop mirroring on a local
-                         # close, leaving the remote pane and its agent running.
+                         # default. Closing a mirror pane/workspace locally
+                         # (e.g. prefix+x) also closes it on the remote. Set
+                         # false to only stop mirroring on a local close,
+                         # leaving the remote pane and its agent running.
+                         # Or "panes": panes and tabs close through, but a
+                         # workspace close only stops mirroring — one wrong
+                         # prefix+x can cost a pane, never every agent in a
+                         # workspace.
 # always_control = true  # default. Mirror panes stay in control: writable, no
                          # idle release, and sized to your local pane so the
                          # remote fills it (ideal for headless remotes). Set
