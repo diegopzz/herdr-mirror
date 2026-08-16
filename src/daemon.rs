@@ -68,7 +68,7 @@ struct HostCtx {
     host: HostConfig,
     local: ApiClient,
     log: Logger,
-    close_remote_on_local_close: bool,
+    close_remote_on_local_close: crate::config::CloseThrough,
     closes: crate::closes::Closes,
 }
 
@@ -455,6 +455,10 @@ async fn local_events_task(
             json!({ "type": "workspace.created" }),
             json!({ "type": "workspace.closed" }),
             json!({ "type": "pane.closed" }),
+            // closing a TAB emits only tab_closed — no pane_closed for the
+            // panes inside it — so without this a tab close never counts as
+            // user intent and close-through silently degrades to tombstoning
+            json!({ "type": "tab.closed" }),
             // renaming a mirror tab locally is intent for the remote tab, which
             // converge resolves against the label it last stamped; without this
             // the rename is never noticed and the next converge reverts it
@@ -479,6 +483,7 @@ async fn local_events_task(
                     let key = match e.event.as_str() {
                         "workspace_closed" => Some("workspace_id"),
                         "pane_closed" => Some("pane_id"),
+                        "tab_closed" => Some("tab_id"),
                         _ => None,
                     };
                     if let Some(k) = key {

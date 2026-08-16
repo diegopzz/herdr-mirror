@@ -117,6 +117,26 @@ pub struct HostConfig {
     pub max_rows: Option<usize>,
 }
 
+/// How far a local close reaches onto the remote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseThrough {
+    /// workspaces AND panes/tabs close through (upstream default)
+    All,
+    /// panes and tabs close through; a workspace close only stops mirroring
+    Panes,
+    /// nothing closes through; every local close only stops mirroring
+    None,
+}
+
+impl CloseThrough {
+    pub fn workspaces(self) -> bool {
+        self == CloseThrough::All
+    }
+    pub fn panes(self) -> bool {
+        self != CloseThrough::None
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MirrorConfig {
     pub poll_seconds: u64,
@@ -125,10 +145,12 @@ pub struct MirrorConfig {
     /// host that remote-create actions target when invoked outside a mirror
     /// (falls back to the first host declared)
     pub default_host: Option<String>,
-    /// when true (the default), closing a mirror workspace/pane locally also
-    /// closes the matching object on the remote. Set false to make a local
-    /// close only stop mirroring, leaving the remote — and any agent — running.
-    pub close_remote_on_local_close: bool,
+    /// what a local close does to the remote (see [`CloseThrough`]). TOML
+    /// accepts `true` (everything — the default), `false` (nothing: a local
+    /// close only stops mirroring), or `"panes"` (panes and tabs close
+    /// through; closing a whole workspace only stops mirroring — one wrong
+    /// prefix+x can cost a pane, never every agent in a workspace).
+    pub close_remote_on_local_close: CloseThrough,
     pub hosts: Vec<HostConfig>,
     /// which hosts.toml this came from. `None` when parsed from a string
     /// (tests). Logged at startup so "which config won?" is never a guess.
@@ -156,7 +178,9 @@ struct RawConfig {
     autostart: Option<bool>,
     poll_seconds: Option<u64>,
     default_host: Option<String>,
-    close_remote_on_local_close: Option<bool>,
+    // bool or the string "panes" — validated in parse (a typo must warn, not
+    // silently become a default that closes remote agents)
+    close_remote_on_local_close: Option<toml::Value>,
     always_control: Option<bool>,
     max_cols: Option<usize>,
     max_rows: Option<usize>,
@@ -343,11 +367,25 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
             return Err(err(format!("hosts.toml: default_host \"{d}\" is not an enabled [hosts.*] entry")));
         }
     }
+    let close_through = match &raw.close_remote_on_local_close {
+        None => CloseThrough::All,
+        Some(toml::Value::Boolean(true)) => CloseThrough::All,
+        Some(toml::Value::Boolean(false)) => CloseThrough::None,
+        Some(toml::Value::String(s)) if s == "panes" => CloseThrough::Panes,
+        Some(v) => {
+            // an unrecognized value must not silently become the destructive
+            // default: fall back to the SAFE end and say so
+            warnings.push(format!(
+                "hosts.toml: close_remote_on_local_close = {v} not understood (want true, false, or \"panes\") — treating as false"
+            ));
+            CloseThrough::None
+        }
+    };
     Ok(MirrorConfig {
         poll_seconds: raw.poll_seconds.unwrap_or(60),
         autostart: raw.autostart.unwrap_or(true),
         default_host: raw.default_host,
-        close_remote_on_local_close: raw.close_remote_on_local_close.unwrap_or(true),
+        close_remote_on_local_close: close_through,
         hosts,
         source: None,
         shadowed: Vec::new(),
@@ -373,6 +411,25 @@ mod tests {
         assert_eq!(h.remote_bin, None); // auto: PATH then ~/.local/bin/herdr
         assert_eq!(h.session, None); // default remote session
         assert!(h.always_control); // default on
+    }
+
+    #[test]
+    fn close_through_parses_bool_string_and_rejects_garbage_safely() {
+        let base = "[hosts.a]\ntarget = \"a\"\n";
+        let c = parse_config(base).unwrap();
+        assert_eq!(c.close_remote_on_local_close, CloseThrough::All); // default
+        let c = parse_config(&format!("close_remote_on_local_close = true\n{base}")).unwrap();
+        assert_eq!(c.close_remote_on_local_close, CloseThrough::All);
+        let c = parse_config(&format!("close_remote_on_local_close = false\n{base}")).unwrap();
+        assert_eq!(c.close_remote_on_local_close, CloseThrough::None);
+        let c = parse_config(&format!("close_remote_on_local_close = \"panes\"\n{base}")).unwrap();
+        assert_eq!(c.close_remote_on_local_close, CloseThrough::Panes);
+        assert!(c.close_remote_on_local_close.panes());
+        assert!(!c.close_remote_on_local_close.workspaces());
+        // a typo must land on the SAFE end (nothing closes through) and warn
+        let c = parse_config(&format!("close_remote_on_local_close = \"pane\"\n{base}")).unwrap();
+        assert_eq!(c.close_remote_on_local_close, CloseThrough::None);
+        assert!(c.warnings.iter().any(|w| w.contains("close_remote_on_local_close")));
     }
 
     #[test]
