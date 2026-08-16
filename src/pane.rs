@@ -735,6 +735,8 @@ struct App {
     control_failures: u32,
     control_sticky: bool,
     pending_input: Vec<Vec<u8>>,
+    /// wheel notches that arrived before control was up; scrolled on connect
+    pending_wheel: Vec<(bool, usize)>,
     last_input: Instant,
     hint_clear_at: Option<Instant>,
     /// predictive local echo — draws keystrokes optimistically, frame-verified
@@ -953,8 +955,24 @@ impl App {
                     }
                 } else {
                     self.pending_input.clear();
+                    self.pending_wheel.clear();
                 }
                 self.session = Some(s);
+                // wheel notches that escalated us here scroll now, coalesced
+                // by direction so a fast flick is one message, not ten
+                if m == Mode::Control && !self.pending_wheel.is_empty() {
+                    let notches = std::mem::take(&mut self.pending_wheel);
+                    let mut merged: Vec<(bool, usize)> = Vec::new();
+                    for (up, n) in notches {
+                        match merged.last_mut() {
+                            Some((u, c)) if *u == up => *c += n,
+                            _ => merged.push((up, n)),
+                        }
+                    }
+                    for (up, n) in merged {
+                        self.emit_wheel(up, n).await;
+                    }
+                }
                 // warm the foreground classification before the user mouses
                 self.spawn_foreground_poll(false);
                 // always-control has no release, so no "ctrl+\ to release" hint
@@ -1248,11 +1266,16 @@ impl App {
                     if self.in_full_control() {
                         self.last_input = Instant::now();
                         self.emit_wheel(h.up, h.count).await;
-                    } else if self.control_sticky {
+                    } else {
+                        // scrolling IS the intent: take control like a
+                        // keystroke would and scroll once the session is up
                         self.control_sticky = false;
-                        self.switch_mode(Mode::Control);
-                    } else if self.mode == Mode::Observe {
-                        self.hint("read-only — type to take control");
+                        if self.pending_wheel.len() < 32 {
+                            self.pending_wheel.push((h.up, h.count));
+                        }
+                        if self.mode == Mode::Observe {
+                            self.switch_mode(Mode::Control);
+                        }
                     }
                 }
                 return;
@@ -1263,15 +1286,13 @@ impl App {
         if self.mode == Mode::Observe || self.switching_to == Some(Mode::Observe) {
             // no quit key: the wrapper's lifecycle belongs to the hosting pane
             if has_mouse_seq(&buf) {
-                // wheel escalates only after a soft release; a stray wheel
-                // while glancing shouldn't grab the remote's lock
+                // scrolling is intent enough: a wheel takes control like a
+                // keystroke and the events deliver once the session is up.
+                // Clicks and drags while merely glancing stay dropped.
                 if contains_wheel_press(&buf) {
-                    if self.control_sticky {
-                        self.control_sticky = false;
-                        self.switch_mode(Mode::Control);
-                    } else {
-                        self.hint("read-only — type to take control");
-                    }
+                    self.control_sticky = false;
+                    self.pending_input.push(buf);
+                    self.switch_mode(Mode::Control);
                 }
                 return;
             }
@@ -1523,6 +1544,7 @@ pub async fn run(args: Args) -> Result<()> {
         control_failures: 0,
         control_sticky: false,
         pending_input: Vec::new(),
+        pending_wheel: Vec::new(),
         last_input: Instant::now(),
         hint_clear_at: None,
         predict: Predictor::new(),
