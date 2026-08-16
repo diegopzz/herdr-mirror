@@ -318,6 +318,10 @@ it in `mouse_local_apps` rather than living without selection in its panes.
                          # (e.g. prefix+x) also closes it on the remote. Set
                          # false to only stop mirroring on a local close,
                          # leaving the remote pane and its agent running.
+                         # Or "panes": panes and tabs close through, but a
+                         # workspace close only stops mirroring — one wrong
+                         # prefix+x can cost a pane, never every agent in a
+                         # workspace.
 # always_control = true  # default. Mirror panes stay in control: writable, no
                          # idle release, and sized to your local pane so the
                          # remote fills it (ideal for headless remotes). Set
