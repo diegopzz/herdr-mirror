@@ -535,7 +535,7 @@ fn whole_chunk_arrow_burst(bytes: &[u8]) -> Option<(bool, usize)> {
             .then(|| b[i + 2] == b'A')
     }
     let up = arrow_at(bytes, 0)?;
-    if bytes.len() % 3 != 0 {
+    if !bytes.len().is_multiple_of(3) {
         return None;
     }
     let n = bytes.len() / 3;
