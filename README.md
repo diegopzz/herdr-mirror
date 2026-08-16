@@ -327,6 +327,12 @@ it in `mouse_local_apps` rather than living without selection in its panes.
                          # mouse reporting, on top of the built-in shell and
                          # agent-CLI lists. Naming one here keeps herdr's native
                          # drag-select working in that program's panes.
+# intercept_native_create = true
+                         # default. A native workspace create that lands in the
+                         # .mirror-pane placeholder (the sidebar's unrebindable
+                         # "+" clicked from inside a mirror) is closed and
+                         # replaced by the host picker. Set false to leave
+                         # native creation alone.
 
 [hosts.work]
 target = "work"
