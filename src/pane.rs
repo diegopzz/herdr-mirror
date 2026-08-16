@@ -481,19 +481,32 @@ enum MouseAction {
     Drop,
 }
 
-/// Wheel always scrolls semantically, regardless of the foreground
-/// classification — the remote herdr server knows the real app's mouse mode
-/// and is a better judge than this side's process-name heuristic (e.g. a TUI
-/// that doesn't consume wheel events, like an agent CLI).
+/// Wheel scrolls semantically for a shell (real scrollback to move) and for a
+/// mouse-aware TUI (the server synthesizes wheel events at the app) — but is
+/// DROPPED for a mouse-blind TUI. Those are alt-screen apps with no
+/// scrollback, so the server's alternate-scroll emulation turns the scroll
+/// into ARROW KEYS typed at the app; in an agent CLI that cycles the
+/// composer's prompt history, so an idle flick of the wheel rewrites what the
+/// user is about to send. No scroll beats corrupted input. The unknown
+/// foreground drops for the same reason clicks do below.
 ///
 /// Clicks and drags forward only when the foreground is *known* to want the
 /// mouse. Unknown drops: sending SGR bytes to a program that never enabled
 /// reporting types garbage into it, and the grab that makes forwarding possible
 /// is the same grab that takes native selection away from herdr — so the
 /// uncertain case should cost the click, not the selection.
-fn mouse_action(remote_wants_mouse: Option<bool>, btn: u32, press: bool) -> MouseAction {
+fn mouse_action(
+    remote_is_shell: Option<bool>,
+    remote_wants_mouse: Option<bool>,
+    btn: u32,
+    press: bool,
+) -> MouseAction {
     if press && (btn == 64 || btn == 65) {
-        MouseAction::Scroll { up: btn == 64 }
+        if remote_is_shell == Some(true) || remote_wants_mouse == Some(true) {
+            MouseAction::Scroll { up: btn == 64 }
+        } else {
+            MouseAction::Drop
+        }
     } else if btn == 66 || btn == 67 {
         MouseAction::Drop
     } else if remote_wants_mouse == Some(true) {
@@ -501,6 +514,37 @@ fn mouse_action(remote_wants_mouse: Option<bool>, btn: u32, press: bool) -> Mous
     } else {
         MouseAction::Drop
     }
+}
+
+/// herdr's alternate-scroll emulation, recognized after the fact. With the
+/// mouse grab released (the price of native selection), the local herdr owns
+/// the wheel again — and for an alternate-screen pane it synthesizes
+/// `mouse_scroll_lines` identical arrow keys per notch, written as ONE chunk.
+/// Typed into an agent CLI those arrows cycle its composer history: a wheel
+/// flick rewrites what the user was about to send. A chunk that is NOTHING
+/// BUT >=3 identical arrows is that emulation — a human keypress arrives one
+/// arrow per chunk, autorepeat one per event, and a bracketed paste carries
+/// its `ESC[200~` prefix — so it is safe to take the burst back and route it
+/// as the wheel it really was. Returns (up, arrow_count).
+fn whole_chunk_arrow_burst(bytes: &[u8]) -> Option<(bool, usize)> {
+    fn arrow_at(b: &[u8], i: usize) -> Option<bool> {
+        (b.len() >= i + 3
+            && b[i] == 0x1b
+            && (b[i + 1] == b'[' || b[i + 1] == b'O')
+            && (b[i + 2] == b'A' || b[i + 2] == b'B'))
+            .then(|| b[i + 2] == b'A')
+    }
+    let up = arrow_at(bytes, 0)?;
+    if bytes.len() % 3 != 0 {
+        return None;
+    }
+    let n = bytes.len() / 3;
+    for k in 1..n {
+        if arrow_at(bytes, k * 3) != Some(up) {
+            return None;
+        }
+    }
+    (n >= 3).then_some((up, n))
 }
 
 fn contains_wheel_press(bytes: &[u8]) -> bool {
@@ -1208,6 +1252,37 @@ impl App {
         // and re-check shortly after input settles, to catch a change the input
         // just caused (e.g. `:q` quitting vim — the poll above still sees vim)
         self.settle_at = Some(Instant::now() + SETTLE_DELAY);
+        // A pure burst of identical arrows is the local herdr's wheel
+        // emulation (see whole_chunk_arrow_burst) — take it back and scroll:
+        // a shell's scrollback moves semantically; a mouse-blind TUI (agent
+        // CLI) gets the wheel re-materialized as SGR, which it consumes as
+        // chat-view scrolling instead of having its composer history cycled.
+        // Unknown or mouse-wanting foregrounds pass through untouched.
+        if let Some((up, arrows)) = whole_chunk_arrow_burst(&buf) {
+            match (self.remote_is_shell, self.remote_wants_mouse) {
+                (Some(true), _) => {
+                    self.send(json!({
+                        "type": "terminal.scroll",
+                        "direction": if up { "up" } else { "down" },
+                        "lines": arrows,
+                        "source": "wheel",
+                        "column": 0,
+                        "row": 0,
+                        "modifiers": 0,
+                    }))
+                    .await;
+                    return;
+                }
+                (Some(false), Some(false)) => {
+                    let sgr: &[u8] = if up { b"\x1b[<64;1;1M" } else { b"\x1b[<65;1;1M" };
+                    let bytes: Vec<u8> = sgr.repeat(arrows.div_ceil(3));
+                    self.send(json!({ "type": "terminal.input", "bytes": B64.encode(&bytes) }))
+                        .await;
+                    return;
+                }
+                _ => {}
+            }
+        }
         // wheel becomes a semantic scroll (server decides app vs scrollback);
         // clicks/drags forward to the remote pty only when the foreground is a
         // TUI — at a shell they're dropped so they don't garbage the prompt
@@ -1216,7 +1291,7 @@ impl App {
         let mut scrolls: Vec<serde_json::Value> = Vec::new();
         while i < buf.len() {
             if let Some((btn, x, y, press, len)) = parse_mouse(&buf, i) {
-                match mouse_action(self.remote_wants_mouse, btn, press) {
+                match mouse_action(self.remote_is_shell, self.remote_wants_mouse, btn, press) {
                     MouseAction::Scroll { up } => {
                         scrolls.push(json!({
                             "type": "terminal.scroll",
@@ -1549,25 +1624,54 @@ mod tests {
     }
 
     #[test]
-    fn wheel_is_always_a_semantic_scroll_whatever_the_foreground() {
-        // wheel must produce a semantic scroll rather than a raw forward, or it
-        // silently does nothing when the app doesn't consume wheel input
-        for who in [Some(true), Some(false), None] {
-            assert_eq!(mouse_action(who, 64, true), MouseAction::Scroll { up: true });
-            assert_eq!(mouse_action(who, 65, true), MouseAction::Scroll { up: false });
-        }
+    fn wheel_scrolls_shells_and_mouse_tuis_but_never_blind_tuis() {
+        // a shell has scrollback: semantic scroll moves it
+        assert_eq!(
+            mouse_action(Some(true), Some(false), 64, true),
+            MouseAction::Scroll { up: true }
+        );
+        // a mouse-aware TUI gets the wheel via the server's app synthesis
+        assert_eq!(
+            mouse_action(Some(false), Some(true), 65, true),
+            MouseAction::Scroll { up: false }
+        );
+        // a mouse-blind TUI (agent CLI) gets NOTHING: the server's
+        // alternate-scroll emulation would type arrow keys into its composer
+        assert_eq!(mouse_action(Some(false), Some(false), 64, true), MouseAction::Drop);
+        // unknown foreground: drop, same reasoning as clicks
+        assert_eq!(mouse_action(None, None, 64, true), MouseAction::Drop);
     }
 
     #[test]
     fn clicks_forward_only_to_a_foreground_that_asked_for_them() {
         // a real mouse-aware TUI (vim, htop) gets the click
-        assert_eq!(mouse_action(Some(true), 0, true), MouseAction::ForwardRaw);
+        assert_eq!(mouse_action(Some(false), Some(true), 0, true), MouseAction::ForwardRaw);
         // a shell or an agent CLI does not: forwarding types SGR garbage into a
         // program that never enabled reporting, and holding the grab needed to
         // forward is what costs herdr its native selection
-        assert_eq!(mouse_action(Some(false), 0, true), MouseAction::Drop);
+        assert_eq!(mouse_action(Some(false), Some(false), 0, true), MouseAction::Drop);
+        assert_eq!(mouse_action(Some(true), Some(false), 0, true), MouseAction::Drop);
         // and while we still don't know, the click is the cheaper thing to lose
-        assert_eq!(mouse_action(None, 0, true), MouseAction::Drop);
+        assert_eq!(mouse_action(None, None, 0, true), MouseAction::Drop);
+    }
+
+    #[test]
+    fn arrow_bursts_are_recognized_and_human_input_is_not() {
+        // herdr's wheel emulation: 3 identical arrows in one chunk
+        assert_eq!(whole_chunk_arrow_burst(b"\x1b[A\x1b[A\x1b[A"), Some((true, 3)));
+        assert_eq!(whole_chunk_arrow_burst(b"\x1b[B\x1b[B\x1b[B"), Some((false, 3)));
+        // application cursor keys mode
+        assert_eq!(whole_chunk_arrow_burst(b"\x1bOA\x1bOA\x1bOA"), Some((true, 3)));
+        // two coalesced notches
+        assert_eq!(whole_chunk_arrow_burst(&b"\x1b[A".repeat(6)), Some((true, 6)));
+        // a single keypress is never a burst
+        assert_eq!(whole_chunk_arrow_burst(b"\x1b[A"), None);
+        assert_eq!(whole_chunk_arrow_burst(b"\x1b[A\x1b[A"), None);
+        // mixed directions or trailing bytes: not the emulation's shape
+        assert_eq!(whole_chunk_arrow_burst(b"\x1b[A\x1b[A\x1b[B"), None);
+        assert_eq!(whole_chunk_arrow_burst(b"\x1b[A\x1b[A\x1b[Ax"), None);
+        // a bracketed paste of arrows keeps its prefix, so it never matches
+        assert_eq!(whole_chunk_arrow_burst(b"\x1b[200~\x1b[A\x1b[A\x1b[A\x1b[201~"), None);
     }
 
     #[test]
