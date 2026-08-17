@@ -1556,7 +1556,10 @@ pub async fn run(args: Args) -> Result<()> {
         // only wraps a paste when the pane's app has enabled it, and a file
         // drop otherwise arrives as bare text with no terminator at all. See
         // `intercept_paste`; the markers never reach the remote.
-        write_stdout("\x1b[?1049h\x1b[2J\x1b[H\x1b[?2004h");
+        // 1007 is alternate-scroll mode: Herdr can turn wheel motion into
+        // Up/Down input on the alternate screen without enabling button or
+        // motion reporting, so native click-and-drag selection stays intact.
+        write_stdout("\x1b[?1049h\x1b[2J\x1b[H\x1b[?2004h\x1b[?1007h");
         RawMode::enable()
     } else {
         None
@@ -1760,7 +1763,7 @@ pub async fn run(args: Args) -> Result<()> {
     if tty {
         // ?1l with the rest: leaving the hosting pane in application cursor mode
         // would misencode arrows for whatever runs there next
-        write_stdout("\x1b[?2004l\x1b[?1002l\x1b[?1006l\x1b[?1l\x1b[?25h\x1b[?1049l");
+        write_stdout("\x1b[?2004l\x1b[?1007l\x1b[?1002l\x1b[?1006l\x1b[?1l\x1b[?25h\x1b[?1049l");
     }
     if let Some(raw) = raw {
         raw.restore();
