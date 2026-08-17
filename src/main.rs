@@ -18,6 +18,7 @@ mod daemon;
 mod docker;
 mod foreground;
 mod grid;
+mod hist;
 mod layout_sync;
 mod mirror;
 mod pane;
