@@ -78,8 +78,23 @@ pub struct Fg {
 pub fn classify(json: &str, extra: &[String]) -> Option<Fg> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
     let fg = v.get("result")?.get("process_info")?.get("foreground_processes")?.as_array()?;
-    // the last foreground process is the actually-running leaf, so `sudo vim`
-    // classifies on `vim`, not `sudo`
+    // An agent CLI anywhere in the chain wins over the leaf. A working
+    // agent's leaf is whatever tool it just spawned (`node`, `python3`,
+    // `rg`, a shell — changing every few seconds), but those children are
+    // batch commands, not TUIs, and the AGENT keeps reading the pty the
+    // whole time. Classifying the leaf made the pane flip to "mouse-wanting
+    // TUI" exactly while the agent worked, so the grab was held and the
+    // wheel forwarded — straight into the fullscreen agent's conversation
+    // view (and native selection died for the duration of every tool call).
+    let agent = fg.iter().filter_map(|p| p.get("name").and_then(|n| n.as_str())).any(|name| {
+        let n = basename(name);
+        MOUSE_BLIND_TUIS.contains(&n.as_str()) || extra.iter().any(|e| basename(e) == n)
+    });
+    if agent {
+        return Some(Fg { is_shell: false, wants_mouse: false });
+    }
+    // otherwise the last foreground process is the actually-running leaf, so
+    // `sudo vim` classifies on `vim`, not `sudo`
     let name = fg.last()?.get("name")?.as_str()?;
     Some(Fg { is_shell: is_shell(name), wants_mouse: wants_mouse(name, extra) })
 }
@@ -168,6 +183,26 @@ mod tests {
         let sudo =
             r#"{"result":{"process_info":{"foreground_processes":[{"name":"sudo"},{"name":"vim"}]}}}"#;
         assert_eq!(classify(sudo, &[]), Some(Fg { is_shell: false, wants_mouse: true }));
+    }
+
+    #[test]
+    fn a_working_agent_still_classifies_as_the_agent_not_its_tool() {
+        // claude mid-tool-call: the leaf is the spawned command, but claude
+        // keeps reading the pty — the pane must NOT flip to mouse-wanting
+        for leaf in ["node", "python3", "rg", "zsh"] {
+            let chain = format!(
+                r#"{{"result":{{"process_info":{{"foreground_processes":[{{"name":"claude"}},{{"name":"sh"}},{{"name":"{leaf}"}}]}}}}}}"#
+            );
+            assert_eq!(
+                classify(&chain, &[]),
+                Some(Fg { is_shell: false, wants_mouse: false }),
+                "claude running {leaf} must stay classified as the agent"
+            );
+        }
+        // the escape-hatch list joins the chain scan too
+        let chain = r#"{"result":{"process_info":{"foreground_processes":[{"name":"myagent"},{"name":"node"}]}}}"#;
+        let extra = vec!["myagent".to_string()];
+        assert_eq!(classify(chain, &extra), Some(Fg { is_shell: false, wants_mouse: false }));
     }
 
     #[test]
