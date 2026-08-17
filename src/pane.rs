@@ -1255,7 +1255,7 @@ impl App {
                 }
                 if self.arrow_hold.as_ref().is_some_and(|h| h.count >= WHEEL_ARROWS) {
                     let h = self.arrow_hold.take().unwrap();
-                    self.wheel_notch(h.up, h.count);
+                    self.wheel_notch(h.up, h.count).await;
                 }
                 return;
             }
@@ -1275,7 +1275,7 @@ impl App {
                 // grab the remote's agent lock for a glance-scroll. Clicks
                 // and drags while merely glancing stay dropped.
                 for up in wheel_presses(&buf) {
-                    self.wheel_notch(up, WHEEL_ARROWS);
+                    self.wheel_notch(up, WHEEL_ARROWS).await;
                 }
                 return;
             }
@@ -1334,7 +1334,7 @@ impl App {
             }
         }
         for up in notches {
-            self.wheel_notch(up, WHEEL_ARROWS);
+            self.wheel_notch(up, WHEEL_ARROWS).await;
         }
         if !rest.is_empty() {
             let msg = json!({ "type": "terminal.input", "bytes": B64.encode(&rest) });
@@ -1375,12 +1375,16 @@ impl App {
         }
     }
 
-    /// A wheel notch over the pane. Up opens or deepens the LOCAL history
-    /// view — the remote pane's server-side history fetched over the existing
-    /// ssh path and rendered here, read-only, no control session and no agent
-    /// lock (see hist.rs for why nothing can be scrolled remotely) — and down
-    /// shallows it until the pane lands back on the live mirror.
-    fn wheel_notch(&mut self, up: bool, lines: usize) {
+    /// A wheel notch opens or deepens the LOCAL history view: the remote
+    /// pane's server-side history is fetched over the existing ssh path and
+    /// rendered here, read-only. This applies in control mode too. Inline and
+    /// classic agent renderers (including Codex) swallow synthetic SGR wheel
+    /// events, so sending them directly makes the wheel appear dead. A
+    /// mouse-aware TUI still receives raw SGR events from mouse_action; only
+    /// events that cannot be delivered safely reach this function.
+    ///
+    /// Down shallows the view until the pane lands back on the live mirror.
+    async fn wheel_notch(&mut self, up: bool, lines: usize) {
         if up {
             if self.hist.is_some() {
                 if let Some(h) = &mut self.hist {
@@ -1552,7 +1556,10 @@ pub async fn run(args: Args) -> Result<()> {
         // only wraps a paste when the pane's app has enabled it, and a file
         // drop otherwise arrives as bare text with no terminator at all. See
         // `intercept_paste`; the markers never reach the remote.
-        write_stdout("\x1b[?1049h\x1b[2J\x1b[H\x1b[?2004h");
+        // 1007 is alternate-scroll mode: Herdr can turn wheel motion into
+        // Up/Down input on the alternate screen without enabling button or
+        // motion reporting, so native click-and-drag selection stays intact.
+        write_stdout("\x1b[?1049h\x1b[2J\x1b[H\x1b[?2004h\x1b[?1007h");
         RawMode::enable()
     } else {
         None
@@ -1756,7 +1763,7 @@ pub async fn run(args: Args) -> Result<()> {
     if tty {
         // ?1l with the rest: leaving the hosting pane in application cursor mode
         // would misencode arrows for whatever runs there next
-        write_stdout("\x1b[?2004l\x1b[?1002l\x1b[?1006l\x1b[?1l\x1b[?25h\x1b[?1049l");
+        write_stdout("\x1b[?2004l\x1b[?1007l\x1b[?1002l\x1b[?1006l\x1b[?1l\x1b[?25h\x1b[?1049l");
     }
     if let Some(raw) = raw {
         raw.restore();
