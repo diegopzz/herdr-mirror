@@ -1375,33 +1375,16 @@ impl App {
         }
     }
 
-    /// A wheel notch over the pane.
+    /// A wheel notch opens or deepens the LOCAL history view: the remote
+    /// pane's server-side history is fetched over the existing ssh path and
+    /// rendered here, read-only. This applies in control mode too. Inline and
+    /// classic agent renderers (including Codex) swallow synthetic SGR wheel
+    /// events, so sending them directly makes the wheel appear dead. A
+    /// mouse-aware TUI still receives raw SGR events from mouse_action; only
+    /// events that cannot be delivered safely reach this function.
     ///
-    /// In FULL CONTROL of an agent pane the wheel is re-materialized as an
-    /// SGR wheel event at the agent, so its LIVE conversation view scrolls —
-    /// that is what the wheel means in the pane you are working in. (A
-    /// classic/inline agent renderer swallows the event without echo — probed
-    /// against Claude Code and codex — so the worst case is a dead wheel,
-    /// never junk in the composer.)
-    ///
-    /// Everywhere else — observing, shells, unknown — up opens or deepens the
-    /// LOCAL history view instead: the remote pane's server-side history
-    /// fetched over the existing ssh path and rendered here, read-only, no
-    /// control session and no agent lock taken for a glance (see hist.rs for
-    /// why nothing else can be scrolled remotely). Down shallows the view
-    /// until the pane lands back on the live mirror.
+    /// Down shallows the view until the pane lands back on the live mirror.
     async fn wheel_notch(&mut self, up: bool, lines: usize) {
-        if self.hist.is_none()
-            && !self.hist_fetching
-            && self.remote_is_shell == Some(false)
-            && self.in_full_control()
-        {
-            self.last_input = Instant::now();
-            let sgr: &[u8] = if up { b"\x1b[<64;1;1M" } else { b"\x1b[<65;1;1M" };
-            let bytes: Vec<u8> = sgr.repeat(lines.div_ceil(WHEEL_ARROWS).max(1));
-            self.send(json!({ "type": "terminal.input", "bytes": B64.encode(&bytes) })).await;
-            return;
-        }
         if up {
             if self.hist.is_some() {
                 if let Some(h) = &mut self.hist {
