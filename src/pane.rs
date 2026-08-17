@@ -473,22 +473,23 @@ fn parse_mouse(bytes: &[u8], at: usize) -> Option<(u32, u32, u32, bool, usize)> 
 /// How a parsed mouse event should be routed while in control mode.
 #[derive(Debug, PartialEq, Eq)]
 enum MouseAction {
-    /// wheel: send as a semantic terminal.scroll (server decides app vs scrollback)
-    Scroll { up: bool },
-    /// click/drag on a remote TUI: forward the raw SGR sequence
+    /// wheel/click/drag on a remote TUI or agent: forward the raw SGR sequence
     ForwardRaw,
-    /// click/drag at a process that never asked for the mouse: drop, keep it local
+    /// event at a process where forwarding could corrupt input: drop, keep it local
     Drop,
 }
 
-/// Wheel scrolls semantically for a shell (real scrollback to move) and for a
-/// mouse-aware TUI (the server synthesizes wheel events at the app) — but is
-/// DROPPED for a mouse-blind TUI. Those are alt-screen apps with no
-/// scrollback, so the server's alternate-scroll emulation turns the scroll
-/// into ARROW KEYS typed at the app; in an agent CLI that cycles the
-/// composer's prompt history, so an idle flick of the wheel rewrites what the
-/// user is about to send. No scroll beats corrupted input. The unknown
-/// foreground drops for the same reason clicks do below.
+/// A wheel forwards its raw SGR to any non-shell foreground and is dropped
+/// otherwise — the same policy as [`emit_wheel`] on the arrow-emulation path.
+/// A mouse-aware TUI asked for exactly this encoding; an agent CLI's
+/// fullscreen renderer consumes it as chat-view scrolling, and the
+/// classic/inline renderers' parsers swallow unrequested SGR without echo
+/// (probed against Claude Code and codex). A SHELL drops it — there is no
+/// safe delivery: the session API's `terminal.scroll` turned out to type
+/// history-cycling ARROW KEYS at any pane whose app never enabled the mouse
+/// (measured), and raw SGR at a prompt is garbage on the command line. No
+/// scroll beats corrupted input. The unknown foreground drops for the same
+/// reason clicks do below.
 ///
 /// Clicks and drags forward only when the foreground is *known* to want the
 /// mouse. Unknown drops: sending SGR bytes to a program that never enabled
@@ -502,8 +503,8 @@ fn mouse_action(
     press: bool,
 ) -> MouseAction {
     if press && (btn == 64 || btn == 65) {
-        if remote_is_shell == Some(true) || remote_wants_mouse == Some(true) {
-            MouseAction::Scroll { up: btn == 64 }
+        if remote_is_shell == Some(false) {
+            MouseAction::ForwardRaw
         } else {
             MouseAction::Drop
         }
@@ -1336,21 +1337,9 @@ impl App {
         // TUI — at a shell they're dropped so they don't garbage the prompt
         let mut rest: Vec<u8> = Vec::with_capacity(buf.len());
         let mut i = 0usize;
-        let mut scrolls: Vec<serde_json::Value> = Vec::new();
         while i < buf.len() {
-            if let Some((btn, x, y, press, len)) = parse_mouse(&buf, i) {
+            if let Some((btn, _x, _y, press, len)) = parse_mouse(&buf, i) {
                 match mouse_action(self.remote_is_shell, self.remote_wants_mouse, btn, press) {
-                    MouseAction::Scroll { up } => {
-                        scrolls.push(json!({
-                            "type": "terminal.scroll",
-                            "direction": if up { "up" } else { "down" },
-                            "lines": 3,
-                            "source": "wheel",
-                            "column": x.saturating_sub(1),
-                            "row": y.saturating_sub(1),
-                            "modifiers": 0,
-                        }));
-                    }
                     MouseAction::ForwardRaw => rest.extend_from_slice(&buf[i..i + len]),
                     MouseAction::Drop => {}
                 }
@@ -1359,9 +1348,6 @@ impl App {
                 rest.push(buf[i]);
                 i += 1;
             }
-        }
-        for s in scrolls {
-            self.send(s).await;
         }
         if !rest.is_empty() {
             let msg = json!({ "type": "terminal.input", "bytes": B64.encode(&rest) });
@@ -1397,33 +1383,29 @@ impl App {
         }
     }
 
-    /// A recognized wheel notch, routed by foreground: a shell's remote
-    /// scrollback scrolls semantically; a mouse-blind TUI (agent CLI) gets
-    /// the wheel re-materialized as SGR, which it consumes as chat-view
-    /// scrolling instead of having its composer history cycled; an unknown
-    /// foreground drops it — the uncertain case should cost the scroll, not
-    /// type junk into whatever is there.
+    /// A recognized wheel notch, re-materialized as an SGR wheel event for
+    /// any non-shell foreground and DROPPED for a shell or an unknown one.
+    ///
+    /// Why not the session API's `terminal.scroll`: it turned out to have
+    /// deliver-to-the-app semantics, not viewport semantics. It cannot reach
+    /// the server-side scrollback, and for a pane whose app never enabled the
+    /// mouse it falls back to typing ARROW KEYS at it (measured: three `^[[A`
+    /// echoed at the prompt, scrollback offset untouched) — at a shell prompt
+    /// those cycle command history, and at an agent composer they cycle
+    /// prompt history. The SGR event is safe across the board instead: a
+    /// mouse-aware TUI asked for exactly this encoding, a fullscreen agent
+    /// renderer consumes it as chat-view scrolling, and the classic/inline
+    /// agent renderers' input parsers swallow unrequested SGR without echo
+    /// (probed against both Claude Code and codex) — so the worst case is a
+    /// dead wheel, never junk in the composer. No scroll beats corrupted
+    /// input, which is also why a shell and the unknown foreground drop.
     async fn emit_wheel(&mut self, up: bool, arrows: usize) {
-        match self.remote_is_shell {
-            Some(true) => {
-                self.send(json!({
-                    "type": "terminal.scroll",
-                    "direction": if up { "up" } else { "down" },
-                    "lines": arrows,
-                    "source": "wheel",
-                    "column": 0,
-                    "row": 0,
-                    "modifiers": 0,
-                }))
-                .await;
-            }
-            Some(false) => {
-                let sgr: &[u8] = if up { b"\x1b[<64;1;1M" } else { b"\x1b[<65;1;1M" };
-                let bytes: Vec<u8> = sgr.repeat(arrows.div_ceil(WHEEL_ARROWS));
-                self.send(json!({ "type": "terminal.input", "bytes": B64.encode(&bytes) })).await;
-            }
-            None => {}
+        if self.remote_is_shell != Some(false) {
+            return;
         }
+        let sgr: &[u8] = if up { b"\x1b[<64;1;1M" } else { b"\x1b[<65;1;1M" };
+        let bytes: Vec<u8> = sgr.repeat(arrows.div_ceil(WHEEL_ARROWS));
+        self.send(json!({ "type": "terminal.input", "bytes": B64.encode(&bytes) })).await;
     }
 
     async fn deliver_input(&mut self, buf: Vec<u8>) {
@@ -1732,20 +1714,15 @@ mod tests {
     }
 
     #[test]
-    fn wheel_scrolls_shells_and_mouse_tuis_but_never_blind_tuis() {
-        // a shell has scrollback: semantic scroll moves it
-        assert_eq!(
-            mouse_action(Some(true), Some(false), 64, true),
-            MouseAction::Scroll { up: true }
-        );
-        // a mouse-aware TUI gets the wheel via the server's app synthesis
-        assert_eq!(
-            mouse_action(Some(false), Some(true), 65, true),
-            MouseAction::Scroll { up: false }
-        );
-        // a mouse-blind TUI (agent CLI) gets NOTHING: the server's
-        // alternate-scroll emulation would type arrow keys into its composer
-        assert_eq!(mouse_action(Some(false), Some(false), 64, true), MouseAction::Drop);
+    fn wheel_forwards_to_any_non_shell_and_never_touches_shells() {
+        // a mouse-aware TUI asked for SGR wheel events — forward with coords
+        assert_eq!(mouse_action(Some(false), Some(true), 65, true), MouseAction::ForwardRaw);
+        // an agent CLI too: fullscreen renderers scroll their chat view with
+        // it, classic/inline parsers swallow it silently
+        assert_eq!(mouse_action(Some(false), Some(false), 64, true), MouseAction::ForwardRaw);
+        // a shell gets NOTHING: terminal.scroll would type history-cycling
+        // arrows and raw SGR is garbage on the command line
+        assert_eq!(mouse_action(Some(true), Some(false), 64, true), MouseAction::Drop);
         // unknown foreground: drop, same reasoning as clicks
         assert_eq!(mouse_action(None, None, 64, true), MouseAction::Drop);
     }
