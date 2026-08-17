@@ -217,6 +217,8 @@ enum Msg {
     /// result of a background foreground-process poll: Some(true)=shell,
     /// Some(false)=TUI, None=poll failed (keep last value)
     Foreground(Option<crate::foreground::Fg>),
+    /// result of a background history fetch for the local history view
+    Hist(Option<Vec<String>>),
     Paste(crate::paste::Outcome),
     Drop(crate::paste::DropResult),
 }
@@ -473,40 +475,35 @@ fn parse_mouse(bytes: &[u8], at: usize) -> Option<(u32, u32, u32, bool, usize)> 
 /// How a parsed mouse event should be routed while in control mode.
 #[derive(Debug, PartialEq, Eq)]
 enum MouseAction {
-    /// wheel/click/drag on a remote TUI or agent: forward the raw SGR sequence
+    /// click/drag on a mouse-aware remote TUI: forward the raw SGR sequence
     ForwardRaw,
+    /// wheel over anything that can't consume it: drive the local history view
+    Notch { up: bool },
     /// event at a process where forwarding could corrupt input: drop, keep it local
     Drop,
 }
 
-/// A wheel forwards its raw SGR to any non-shell foreground and is dropped
-/// otherwise — the same policy as [`emit_wheel`] on the arrow-emulation path.
-/// A mouse-aware TUI asked for exactly this encoding; an agent CLI's
-/// fullscreen renderer consumes it as chat-view scrolling, and the
-/// classic/inline renderers' parsers swallow unrequested SGR without echo
-/// (probed against Claude Code and codex). A SHELL drops it — there is no
-/// safe delivery: the session API's `terminal.scroll` turned out to type
-/// history-cycling ARROW KEYS at any pane whose app never enabled the mouse
-/// (measured), and raw SGR at a prompt is garbage on the command line. No
-/// scroll beats corrupted input. The unknown foreground drops for the same
-/// reason clicks do below.
+/// A wheel forwards its raw SGR only to a foreground that verifiably wants
+/// the mouse — it asked for exactly this encoding. Everything else gets the
+/// LOCAL history view instead (see hist.rs): nothing can be scrolled remotely
+/// — the session API's `terminal.scroll` turned out to type history-cycling
+/// ARROW KEYS at any pane whose app never enabled the mouse (measured), and a
+/// classic/inline agent renderer swallows re-materialized SGR without moving
+/// anything (probed against Claude Code and codex) — while the pane's real
+/// history is always readable server-side. The view is read-only and local,
+/// so even the unknown foreground gets it: a glance-scroll costs nothing.
 ///
 /// Clicks and drags forward only when the foreground is *known* to want the
 /// mouse. Unknown drops: sending SGR bytes to a program that never enabled
 /// reporting types garbage into it, and the grab that makes forwarding possible
 /// is the same grab that takes native selection away from herdr — so the
 /// uncertain case should cost the click, not the selection.
-fn mouse_action(
-    remote_is_shell: Option<bool>,
-    remote_wants_mouse: Option<bool>,
-    btn: u32,
-    press: bool,
-) -> MouseAction {
+fn mouse_action(remote_wants_mouse: Option<bool>, btn: u32, press: bool) -> MouseAction {
     if press && (btn == 64 || btn == 65) {
-        if remote_is_shell == Some(false) {
+        if remote_wants_mouse == Some(true) {
             MouseAction::ForwardRaw
         } else {
-            MouseAction::Drop
+            MouseAction::Notch { up: btn == 64 }
         }
     } else if btn == 66 || btn == 67 {
         MouseAction::Drop
@@ -564,19 +561,22 @@ struct ArrowHold {
 const ARROW_HOLD_WINDOW: Duration = Duration::from_millis(35);
 const WHEEL_ARROWS: usize = 3; // herdr's mouse_scroll_lines default
 
-fn contains_wheel_press(bytes: &[u8]) -> bool {
+/// Every wheel press in the chunk, in order: `true` = up. Empty for clicks,
+/// drags, releases and plain text.
+fn wheel_presses(bytes: &[u8]) -> Vec<bool> {
+    let mut presses = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
         if let Some((btn, _, _, press, len)) = parse_mouse(bytes, i) {
             if press && (btn == 64 || btn == 65) {
-                return true;
+                presses.push(btn == 64);
             }
             i += len;
         } else {
             i += 1;
         }
     }
-    false
+    presses
 }
 
 /// Cap on a partially-received bracketed paste. Past this we stop waiting for
@@ -736,8 +736,12 @@ struct App {
     control_failures: u32,
     control_sticky: bool,
     pending_input: Vec<Vec<u8>>,
-    /// wheel notches that arrived before control was up; scrolled on connect
-    pending_wheel: Vec<(bool, usize)>,
+    /// local history view (wheel-up over the pane); None = live mirror
+    hist: Option<crate::hist::HistView>,
+    /// a history fetch is in flight
+    hist_fetching: bool,
+    /// wheel-up lines accumulated while the fetch is in flight
+    hist_pending: usize,
     last_input: Instant,
     hint_clear_at: Option<Instant>,
     /// predictive local echo — draws keystrokes optimistically, frame-verified
@@ -956,24 +960,8 @@ impl App {
                     }
                 } else {
                     self.pending_input.clear();
-                    self.pending_wheel.clear();
                 }
                 self.session = Some(s);
-                // wheel notches that escalated us here scroll now, coalesced
-                // by direction so a fast flick is one message, not ten
-                if m == Mode::Control && !self.pending_wheel.is_empty() {
-                    let notches = std::mem::take(&mut self.pending_wheel);
-                    let mut merged: Vec<(bool, usize)> = Vec::new();
-                    for (up, n) in notches {
-                        match merged.last_mut() {
-                            Some((u, c)) if *u == up => *c += n,
-                            _ => merged.push((up, n)),
-                        }
-                    }
-                    for (up, n) in merged {
-                        self.emit_wheel(up, n).await;
-                    }
-                }
                 // warm the foreground classification before the user mouses
                 self.spawn_foreground_poll(false);
                 // always-control has no release, so no "ctrl+\ to release" hint
@@ -1042,7 +1030,9 @@ impl App {
         if frame.kind == "terminal.closed" {
             let suffix = frame.reason.as_deref().map(|r| format!(": {r}")).unwrap_or_default();
             self.renderer.status(&format!("remote terminal closed{suffix}"));
-            self.paint();
+            if self.hist.is_none() {
+                self.paint();
+            }
             return;
         }
         if frame.kind != "terminal.frame" {
@@ -1087,7 +1077,9 @@ impl App {
                 frame.height.unwrap_or(0),
                 lines.join("\n")
             );
-        } else {
+        } else if self.hist.is_none() {
+            // the grid stays current underneath the history view; the paint
+            // waits until the view exits
             self.paint();
         }
     }
@@ -1244,10 +1236,9 @@ impl App {
         // emulation (the grab is released, so a wheel arrives as synthesized
         // arrows) hits the observe branch below as "any keystroke", where it
         // would escalate to control and cycle an agent CLI's prompt history.
-        // Hold pure-arrow chunks; a notch inside the window is a wheel and is
-        // routed (full control) or treated like the stray SGR wheel below
-        // (observe: never grab the remote's lock for a glance-scroll);
-        // anything less flushes as the keystrokes it was.
+        // Hold pure-arrow chunks; a notch inside the window is a wheel and
+        // drives the LOCAL history view; anything less flushes as the
+        // keystrokes it was.
         if self.remote_wants_mouse != Some(true) {
             if let Some((up, n, seq)) = whole_chunk_arrows(&buf) {
                 match &mut self.arrow_hold {
@@ -1264,36 +1255,27 @@ impl App {
                 }
                 if self.arrow_hold.as_ref().is_some_and(|h| h.count >= WHEEL_ARROWS) {
                     let h = self.arrow_hold.take().unwrap();
-                    if self.in_full_control() {
-                        self.last_input = Instant::now();
-                        self.emit_wheel(h.up, h.count).await;
-                    } else {
-                        // scrolling IS the intent: take control like a
-                        // keystroke would and scroll once the session is up
-                        self.control_sticky = false;
-                        if self.pending_wheel.len() < 32 {
-                            self.pending_wheel.push((h.up, h.count));
-                        }
-                        if self.mode == Mode::Observe {
-                            self.switch_mode(Mode::Control);
-                        }
-                    }
+                    self.wheel_notch(h.up, h.count);
                 }
                 return;
             }
             // any other input first flushes held arrows, keeping their order
             self.flush_arrow_hold().await;
         }
+        // any real (non-mouse) input returns the pane from the history view
+        // to live, then behaves exactly as it would have; mouse events fall
+        // through so the wheel keeps driving the view
+        if self.hist.is_some() && !has_mouse_seq(&buf) {
+            self.exit_hist();
+        }
         if self.mode == Mode::Observe || self.switching_to == Some(Mode::Observe) {
             // no quit key: the wrapper's lifecycle belongs to the hosting pane
             if has_mouse_seq(&buf) {
-                // scrolling is intent enough: a wheel takes control like a
-                // keystroke and the events deliver once the session is up.
-                // Clicks and drags while merely glancing stay dropped.
-                if contains_wheel_press(&buf) {
-                    self.control_sticky = false;
-                    self.pending_input.push(buf);
-                    self.switch_mode(Mode::Control);
+                // a wheel opens the local history view — read-only, never
+                // grab the remote's agent lock for a glance-scroll. Clicks
+                // and drags while merely glancing stay dropped.
+                for up in wheel_presses(&buf) {
+                    self.wheel_notch(up, WHEEL_ARROWS);
                 }
                 return;
             }
@@ -1336,11 +1318,13 @@ impl App {
         // clicks/drags forward to the remote pty only when the foreground is a
         // TUI — at a shell they're dropped so they don't garbage the prompt
         let mut rest: Vec<u8> = Vec::with_capacity(buf.len());
+        let mut notches: Vec<bool> = Vec::new();
         let mut i = 0usize;
         while i < buf.len() {
             if let Some((btn, _x, _y, press, len)) = parse_mouse(&buf, i) {
-                match mouse_action(self.remote_is_shell, self.remote_wants_mouse, btn, press) {
+                match mouse_action(self.remote_wants_mouse, btn, press) {
                     MouseAction::ForwardRaw => rest.extend_from_slice(&buf[i..i + len]),
+                    MouseAction::Notch { up } => notches.push(up),
                     MouseAction::Drop => {}
                 }
                 i += len;
@@ -1348,6 +1332,9 @@ impl App {
                 rest.push(buf[i]);
                 i += 1;
             }
+        }
+        for up in notches {
+            self.wheel_notch(up, WHEEL_ARROWS);
         }
         if !rest.is_empty() {
             let msg = json!({ "type": "terminal.input", "bytes": B64.encode(&rest) });
@@ -1367,8 +1354,13 @@ impl App {
 
     /// Held arrows turned out to be keystrokes — deliver them the way the
     /// mode they arrived in would have: sent directly under full control,
-    /// queued (and escalating, exactly like any typed key) otherwise.
+    /// queued (and escalating, exactly like any typed key) otherwise. A real
+    /// keystroke also returns the pane from the history view first, so the
+    /// arrow acts on the live remote the user now sees.
     async fn flush_arrow_hold(&mut self) {
+        if self.arrow_hold.is_some() && self.hist.is_some() {
+            self.exit_hist();
+        }
         if let Some(h) = self.arrow_hold.take() {
             let bytes: Vec<u8> = h.seq.repeat(h.count);
             if self.in_full_control() {
@@ -1383,29 +1375,106 @@ impl App {
         }
     }
 
-    /// A recognized wheel notch, re-materialized as an SGR wheel event for
-    /// any non-shell foreground and DROPPED for a shell or an unknown one.
-    ///
-    /// Why not the session API's `terminal.scroll`: it turned out to have
-    /// deliver-to-the-app semantics, not viewport semantics. It cannot reach
-    /// the server-side scrollback, and for a pane whose app never enabled the
-    /// mouse it falls back to typing ARROW KEYS at it (measured: three `^[[A`
-    /// echoed at the prompt, scrollback offset untouched) — at a shell prompt
-    /// those cycle command history, and at an agent composer they cycle
-    /// prompt history. The SGR event is safe across the board instead: a
-    /// mouse-aware TUI asked for exactly this encoding, a fullscreen agent
-    /// renderer consumes it as chat-view scrolling, and the classic/inline
-    /// agent renderers' input parsers swallow unrequested SGR without echo
-    /// (probed against both Claude Code and codex) — so the worst case is a
-    /// dead wheel, never junk in the composer. No scroll beats corrupted
-    /// input, which is also why a shell and the unknown foreground drop.
-    async fn emit_wheel(&mut self, up: bool, arrows: usize) {
-        if self.remote_is_shell != Some(false) {
+    /// A wheel notch over the pane. Up opens or deepens the LOCAL history
+    /// view — the remote pane's server-side history fetched over the existing
+    /// ssh path and rendered here, read-only, no control session and no agent
+    /// lock (see hist.rs for why nothing can be scrolled remotely) — and down
+    /// shallows it until the pane lands back on the live mirror.
+    fn wheel_notch(&mut self, up: bool, lines: usize) {
+        if up {
+            if self.hist.is_some() {
+                if let Some(h) = &mut self.hist {
+                    h.offset += lines;
+                }
+                self.paint_hist();
+            } else if self.hist_fetching {
+                self.hist_pending += lines;
+            } else {
+                self.hist_fetching = true;
+                self.hist_pending = lines;
+                self.hint_sticky("history…");
+                self.spawn_hist_fetch();
+            }
+        } else if self.hist_fetching {
+            // scrolled back down before the fetch landed; reaching zero
+            // cancels the view (handle_hist discards the result)
+            self.hist_pending = self.hist_pending.saturating_sub(lines);
+        } else if let Some(off) = self.hist.as_ref().map(|h| h.offset) {
+            if off <= lines {
+                self.exit_hist();
+            } else {
+                if let Some(h) = &mut self.hist {
+                    h.offset = off - lines;
+                }
+                self.paint_hist();
+            }
+        }
+    }
+
+    /// Kick the background history fetch; the result arrives as Msg::Hist.
+    fn spawn_hist_fetch(&mut self) {
+        let tx = self.tx.clone();
+        let ssh = self.args.ssh_target.clone();
+        let bin = self.args.remote_bin.clone();
+        let session = self.args.session.clone();
+        let pane = self.args.pane_target.clone();
+        let ctl = self.args.ctl_path.clone();
+        let container = self.args.container.clone();
+        tokio::spawn(async move {
+            let v = crate::hist::fetch(
+                &ssh,
+                bin.as_deref(),
+                session.as_deref(),
+                &pane,
+                ctl.as_deref(),
+                container.as_ref(),
+            )
+            .await;
+            let _ = tx.send(Msg::Hist(v)).await;
+        });
+    }
+
+    fn handle_hist(&mut self, lines: Option<Vec<String>>) {
+        self.hist_fetching = false;
+        let pending = std::mem::take(&mut self.hist_pending);
+        match lines {
+            None => self.hint("history unavailable"),
+            Some(_) if pending == 0 => {
+                // the user scrolled back down while the fetch was in flight
+                self.renderer.status("");
+                self.paint();
+            }
+            Some(lines) => {
+                self.hist = Some(crate::hist::HistView { lines, offset: pending });
+                self.paint_hist();
+            }
+        }
+    }
+
+    fn paint_hist(&mut self) {
+        if !self.tty {
             return;
         }
-        let sgr: &[u8] = if up { b"\x1b[<64;1;1M" } else { b"\x1b[<65;1;1M" };
-        let bytes: Vec<u8> = sgr.repeat(arrows.div_ceil(WHEEL_ARROWS));
-        self.send(json!({ "type": "terminal.input", "bytes": B64.encode(&bytes) })).await;
+        let (cols, rows) = term_size();
+        let Some(view) = self.hist.as_ref() else { return };
+        let (out, off) = crate::hist::render(view, cols, rows);
+        if let Some(h) = self.hist.as_mut() {
+            h.offset = off;
+        }
+        write_stdout(&out);
+    }
+
+    /// Leave the history view: restore autowrap and the cursor, then repaint
+    /// the live grid from scratch.
+    fn exit_hist(&mut self) {
+        self.hist = None;
+        self.hist_pending = 0;
+        if self.tty {
+            write_stdout("\x1b[?7h\x1b[?25h");
+        }
+        self.renderer.status("");
+        self.renderer.invalidate();
+        self.paint();
     }
 
     async fn deliver_input(&mut self, buf: Vec<u8>) {
@@ -1526,7 +1595,9 @@ pub async fn run(args: Args) -> Result<()> {
         control_failures: 0,
         control_sticky: false,
         pending_input: Vec::new(),
-        pending_wheel: Vec::new(),
+        hist: None,
+        hist_fetching: false,
+        hist_pending: 0,
         last_input: Instant::now(),
         hint_clear_at: None,
         predict: Predictor::new(),
@@ -1604,11 +1675,16 @@ pub async fn run(args: Args) -> Result<()> {
                         app.sync_mouse_grab();
                         app.sync_cursor_key_mode();
                     },
+                    Some(Msg::Hist(v)) => app.handle_hist(v),
                     Some(Msg::Paste(outcome)) => app.handle_paste(outcome).await,
                     Some(Msg::Drop(result)) => app.handle_drop(result).await,
                 }
             }
             _ = sigwinch.recv() => {
+                // a resize invalidates the view's row addressing — go live
+                if app.hist.is_some() {
+                    app.exit_hist();
+                }
                 app.renderer.invalidate();
                 // a resize means a client is laying this pane out, so the size is
                 // now a real viewport: take control if that is what we're for.
@@ -1714,30 +1790,27 @@ mod tests {
     }
 
     #[test]
-    fn wheel_forwards_to_any_non_shell_and_never_touches_shells() {
+    fn wheel_forwards_to_mouse_tuis_and_drives_the_view_everywhere_else() {
         // a mouse-aware TUI asked for SGR wheel events — forward with coords
-        assert_eq!(mouse_action(Some(false), Some(true), 65, true), MouseAction::ForwardRaw);
-        // an agent CLI too: fullscreen renderers scroll their chat view with
-        // it, classic/inline parsers swallow it silently
-        assert_eq!(mouse_action(Some(false), Some(false), 64, true), MouseAction::ForwardRaw);
-        // a shell gets NOTHING: terminal.scroll would type history-cycling
-        // arrows and raw SGR is garbage on the command line
-        assert_eq!(mouse_action(Some(true), Some(false), 64, true), MouseAction::Drop);
-        // unknown foreground: drop, same reasoning as clicks
-        assert_eq!(mouse_action(None, None, 64, true), MouseAction::Drop);
+        assert_eq!(mouse_action(Some(true), 65, true), MouseAction::ForwardRaw);
+        // everything else — shell, agent CLI, unknown — gets the local
+        // history view: nothing can be scrolled remotely, and the view is
+        // read-only so even the uncertain case costs nothing
+        assert_eq!(mouse_action(Some(false), 64, true), MouseAction::Notch { up: true });
+        assert_eq!(mouse_action(Some(false), 65, true), MouseAction::Notch { up: false });
+        assert_eq!(mouse_action(None, 64, true), MouseAction::Notch { up: true });
     }
 
     #[test]
     fn clicks_forward_only_to_a_foreground_that_asked_for_them() {
         // a real mouse-aware TUI (vim, htop) gets the click
-        assert_eq!(mouse_action(Some(false), Some(true), 0, true), MouseAction::ForwardRaw);
+        assert_eq!(mouse_action(Some(true), 0, true), MouseAction::ForwardRaw);
         // a shell or an agent CLI does not: forwarding types SGR garbage into a
         // program that never enabled reporting, and holding the grab needed to
         // forward is what costs herdr its native selection
-        assert_eq!(mouse_action(Some(false), Some(false), 0, true), MouseAction::Drop);
-        assert_eq!(mouse_action(Some(true), Some(false), 0, true), MouseAction::Drop);
+        assert_eq!(mouse_action(Some(false), 0, true), MouseAction::Drop);
         // and while we still don't know, the click is the cheaper thing to lose
-        assert_eq!(mouse_action(None, None, 0, true), MouseAction::Drop);
+        assert_eq!(mouse_action(None, 0, true), MouseAction::Drop);
     }
 
     #[test]
@@ -1766,9 +1839,10 @@ mod tests {
         let seq = b"\x1b[<64;10;5M";
         let (btn, x, y, press, len) = parse_mouse(seq, 0).unwrap();
         assert_eq!((btn, x, y, press, len), (64, 10, 5, true, seq.len()));
-        assert!(contains_wheel_press(seq));
-        assert!(!contains_wheel_press(b"\x1b[<0;3;4M")); // click, not wheel
-        assert!(!contains_wheel_press(b"\x1b[<64;10;5m")); // release, not press
+        assert_eq!(wheel_presses(seq), vec![true]);
+        assert_eq!(wheel_presses(b"\x1b[<65;1;1M\x1b[<64;1;1M"), vec![false, true]);
+        assert!(wheel_presses(b"\x1b[<0;3;4M").is_empty()); // click, not wheel
+        assert!(wheel_presses(b"\x1b[<64;10;5m").is_empty()); // release, not press
         assert!(has_mouse_seq(b"xx\x1b[<0;1;1Myy"));
         assert!(!has_mouse_seq(b"plain text"));
     }
