@@ -694,6 +694,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
         .values()
         .map(|e| e.local_id.clone())
         .chain(state.panes.values().map(|e| e.local_id.clone()))
+        .chain(state.tabs.values().map(|e| e.local_id.clone()))
         .collect();
     let user_closed = match deps.closes.lock() {
         Ok(mut t) => t.take_user_closed(&mine),
@@ -718,6 +719,8 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
     }
     let pane_ws: HashMap<&str, &str> =
         remote_snap.panes.iter().map(|p| (p.pane_id.as_str(), p.workspace_id.as_str())).collect();
+    let pane_tab: HashMap<&str, &str> =
+        remote_snap.panes.iter().map(|p| (p.pane_id.as_str(), p.tab_id.as_str())).collect();
     let mut drop_panes: Vec<String> = Vec::new();
     let mut pane_close_remote: Vec<String> = Vec::new();
     for (rid, entry) in state.panes.iter_mut() {
@@ -729,7 +732,14 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
             match ws_entry {
                 Some(w) if !w.is_tombstoned() && local_ws_ids.contains(&w.local_id) => {
                     entry.tombstone = Some(true);
-                    if close_remote && user_closed.contains(&entry.local_id) {
+                    // user intent covers the pane itself AND its whole tab:
+                    // closing a tab emits only tab_closed, so the panes inside
+                    // it are claimed through their tab's mapped local id
+                    let tab_closed = pane_tab
+                        .get(rid.as_str())
+                        .and_then(|t| state.tabs.get(*t))
+                        .is_some_and(|e| user_closed.contains(&e.local_id));
+                    if close_remote && (user_closed.contains(&entry.local_id) || tab_closed) {
                         pane_close_remote.push(rid.clone());
                     } else {
                         log.log(&format!("pane mirror for {rid} was closed locally — tombstoning"));
