@@ -88,7 +88,7 @@ read-only: a live view with zero effect on the remote that escalates to control
 when you type and auto-releases after 1h idle (`ctrl+\` releases immediately).
 
 **Close / restore** — by default, closing a mirror (`prefix+x`) also closes the
-pane/workspace on the remote (`close_remote_on_local_close`; set it false to
+pane/tab/workspace on the remote (`close_remote_on_local_close`; set it false to
 only stop mirroring and leave the remote — and its agent — running). When the
 remote is left running, the **restore** action (`herdr-mirror restore`) brings
 back mirrors you closed.
@@ -306,10 +306,10 @@ shell and a TUI there's a brief lag before the mouse mode catches up.
 # default_host = "work"  # host that "new remote workspace" targets when
                          # invoked outside any mirror (default: first host)
 # close_remote_on_local_close = true
-                         # default. Closing a mirror pane/workspace locally
-                         # (e.g. prefix+x) also closes it on the remote. Set
-                         # false to only stop mirroring on a local close,
-                         # leaving the remote pane and its agent running.
+                         # default. Closing a mirror pane/tab/workspace
+                         # locally (e.g. prefix+x) also closes it on the
+                         # remote. Set false to only stop mirroring on a local
+                         # close, leaving the remote pane and its agent running.
 # always_control = true  # default. Mirror panes stay in control: writable, no
                          # idle release, and sized to your local pane so the
                          # remote fills it (ideal for headless remotes). Set

@@ -125,8 +125,8 @@ pub struct MirrorConfig {
     /// host that remote-create actions target when invoked outside a mirror
     /// (falls back to the first host declared)
     pub default_host: Option<String>,
-    /// when true (the default), closing a mirror workspace/pane locally also
-    /// closes the matching object on the remote. Set false to make a local
+    /// when true (the default), closing a mirror workspace/pane/tab locally
+    /// also closes the matching object on the remote. Set false to make a local
     /// close only stop mirroring, leaving the remote — and any agent — running.
     pub close_remote_on_local_close: bool,
     /// when true (the default), a native workspace create that lands in the
