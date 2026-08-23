@@ -4,6 +4,7 @@
 //   herdr-mirror daemon                 # control plane (foreground; `start` spawns this)
 //   herdr-mirror pane <host> <target>   # data plane: one per mirror pane
 //   herdr-mirror start|pause|ensure|status|once|restore|teardown
+//   herdr-mirror hide|show [host]       # toggle a connection's mirrors out of view
 //   herdr-mirror pick-workspace [--menu]            # popup host picker
 //   herdr-mirror remote-workspace|remote-tab|remote-split <right|down>
 //   herdr-mirror remote-invoke <plugin>.<action>
@@ -26,6 +27,7 @@ mod pick;
 mod predict;
 mod remote;
 mod remote_action;
+mod select;
 mod ssh_relay;
 mod state;
 mod util;
@@ -87,6 +89,8 @@ fn run_on(rt: &tokio::runtime::Runtime, cmd: &str, rest: &[String]) -> Result<()
             rest.get(2).map(String::as_str),
         ),
         "teardown" => rt.block_on(daemon::cmd_teardown(Env::resolve()?)),
+        "hide" => rt.block_on(remote_action::hide_cmd(Env::resolve()?, rest.get(1).map(String::as_str))),
+        "show" => rt.block_on(remote_action::show_cmd(Env::resolve()?, rest.get(1).map(String::as_str))),
         "pane" => {
             let args = pane::parse_args(&rest[1..])?;
             rt.block_on(pane::run(args))
@@ -131,7 +135,7 @@ fn run_on(rt: &tokio::runtime::Runtime, cmd: &str, rest: &[String]) -> Result<()
             rt.block_on(binding::unbind(Env::resolve()?, what))
         }
         other => Err(util::err(format!(
-            "unknown command: {other} (daemon|pane|start|pause|ensure|status|once|restore|teardown|pick-workspace|remote-workspace|remote-tab|remote-split|remote-invoke|remote-actions|bind|unbind)"
+            "unknown command: {other} (daemon|pane|start|pause|ensure|status|once|restore|teardown|hide|show|pick-workspace|remote-workspace|remote-tab|remote-split|remote-invoke|remote-actions|bind|unbind)"
         ))),
     }
 }

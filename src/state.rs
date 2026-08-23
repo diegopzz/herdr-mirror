@@ -88,6 +88,38 @@ pub struct HostState {
     pub ratios: BTreeMap<String, f64>,
 }
 
+/// Marker for `hide`: this host's mirrors are off the sidebar until `show`.
+///
+/// Deliberately its OWN file rather than a field on `HostState`. The map file is
+/// load-modify-written by the daemon, by every CLI subcommand, and by converge
+/// around a pass that spans dozens of awaits, with no lock anywhere — so a flag
+/// living inside it is silently reset by whoever saves last, and `hide` reports
+/// success having done nothing. A marker file has no such race: it is written by
+/// one process and only ever read by the others. Same shape as `daemon.paused`.
+pub fn hidden_path(state_dir: &Path, host: &str) -> PathBuf {
+    state_dir.join(format!("{host}.hidden"))
+}
+
+pub fn is_hidden(state_dir: &Path, host: &str) -> bool {
+    hidden_path(state_dir, host).exists()
+}
+
+/// Returns the error rather than swallowing it: this one write gates the whole
+/// feature, so a read-only state dir or a host name that is not a single path
+/// component would otherwise make `hide` claim success forever while nothing
+/// ever acts on it.
+pub fn set_hidden(state_dir: &Path, host: &str, hidden: bool) -> std::io::Result<()> {
+    let path = hidden_path(state_dir, host);
+    if hidden {
+        std::fs::write(path, "")
+    } else {
+        match std::fs::remove_file(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        }
+    }
+}
+
 pub fn state_path(state_dir: &Path, host: &str) -> PathBuf {
     state_dir.join(format!("{host}-map.json"))
 }
@@ -141,5 +173,21 @@ mod tests {
         assert!(out.contains("rootTabLocalId"));
         // absent options stay absent
         assert!(!out.contains("\"reported\":null"));
+    }
+
+    #[test]
+    fn hidden_is_a_marker_file_not_a_state_field() {
+        let dir = std::env::temp_dir().join(format!("hm-hidden-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        assert!(!is_hidden(&dir, "h"));
+        set_hidden(&dir, "h", true).unwrap();
+        assert!(is_hidden(&dir, "h"));
+        // and it survives a map rewrite, which is the whole reason it is not a
+        // field on HostState
+        save_state(&dir, "h", &HostState::default()).unwrap();
+        assert!(is_hidden(&dir, "h"));
+        set_hidden(&dir, "h", false).unwrap();
+        assert!(!is_hidden(&dir, "h"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
