@@ -709,11 +709,31 @@ fn run_menu(rows: &[Row], note: Option<&str>) -> Result<Option<usize>> {
             }
             // a click on an option row picks it outright; anywhere else ignores
             Key::Click { y } => {
-                if let Some(idx) = (y as usize).checked_sub(FIRST_ROW_Y) {
-                    if idx < rows.len() {
+                let idx = (y as usize).checked_sub(FIRST_ROW_Y).filter(|i| *i < rows.len());
+                match idx {
+                    // NEVER let a CLICK resolve to row 0, "this machine".
+                    //
+                    // FIRST_ROW_Y counts draw()'s preamble assuming this pane's own
+                    // row 1 is what the mouse reports as row 1. The popup is a
+                    // floating BORDERED pane (open_popup sends placement = "popup")
+                    // placed anywhere on the screen, so that assumption is unverified
+                    // -- and its failure is NOT symmetric. Row 0 is the only entry
+                    // that runs create_local(), which passes the local CWD_ENV: a
+                    // misaimed click there silently opens a new LOCAL workspace in
+                    // the local directory while the user believes they picked a
+                    // remote host. That is the reported bug -- click "macbook", get a
+                    // new local path. Every other misaim picks a different remote
+                    // host, which is visible and harmless, or falls outside the list
+                    // and is already ignored.
+                    //
+                    // "this machine" stays one keypress away: it is the default
+                    // selection so Enter takes it, and so does `1`.
+                    Some(0) => {}
+                    Some(i) => {
                         finish(&mut out);
-                        return Ok(Some(idx));
+                        return Ok(Some(i));
                     }
+                    None => {}
                 }
             }
             Key::Enter => {
@@ -735,6 +755,7 @@ fn run_menu(rows: &[Row], note: Option<&str>) -> Result<Option<usize>> {
 /// positions each row absolutely from this, and the click handler subtracts it,
 /// so the two can no longer disagree about where the list actually is.
 const FIRST_ROW_Y: usize = 6;
+
 
 fn draw(out: &mut impl Write, rows: &[Row], sel: usize, note: Option<&str>) {
     // full redraw each keypress: the popup is tiny and this keeps it stateless
