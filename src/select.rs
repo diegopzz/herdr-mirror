@@ -32,8 +32,12 @@
 // the mouse" to keep, which is the whole reason this shape was chosen: such a
 // list is unbounded, drifts, and fails silently when it is wrong.
 //
-// A shell foreground is still handled the old way (the grab is released and
-// herdr selects natively), so none of this applies at a prompt.
+// The grab is always held, including at a shell, so the wheel reaches us as
+// terminal.scroll (the pane is on the alt screen and has no local scrollback,
+// so releasing the grab cannot scroll). Left-button drags therefore use this
+// selector at a prompt too. A click that never moved is not replayed to a
+// shell — a prompt never enabled mouse reporting, and the bytes would dump
+// into it. TUI clicks still replay as before.
 
 use std::fmt::Write as _;
 

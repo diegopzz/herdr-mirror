@@ -465,11 +465,12 @@ enum MouseAction {
     Scroll { up: bool },
     /// click/drag on a remote TUI: forward the raw SGR sequence
     ForwardRaw,
-    /// left press/drag/release on a remote TUI: hand it to the local selection,
-    /// which defers the press and replays it if the gesture turns out to be a
-    /// click rather than a drag (see src/select.rs)
+    /// left press/drag/release: hand it to the plugin selector, which defers
+    /// the press and (on a TUI) replays it if the gesture was a click rather
+    /// than a drag (see src/select.rs)
     Select,
-    /// click/drag at a shell (or unclassified): drop, keep mouse local
+    /// unclassified, or a non-left button at a shell: drop so SGR never
+    /// reaches a prompt that never enabled mouse reporting
     Drop,
 }
 
@@ -491,18 +492,20 @@ fn button_number(btn: u32) -> u32 {
 /// and is a better judge than this side's process-name heuristic (e.g. a TUI
 /// that doesn't consume wheel events, like an agent CLI). Non-wheel
 /// clicks/drags keep the existing foreground-based routing.
-/// The left button goes to the local selection in every remote TUI, agent or
-/// not, because a drag is the gesture with no substitute: an app's click can be
-/// replayed after the fact, a selection cannot be recovered.
+/// The left button goes to the plugin selector in every classified foreground
+/// (TUI, agent, or shell), because a drag is the gesture with no substitute:
+/// an app's click can be replayed after the fact, a selection cannot be
+/// recovered. The grab is always held, so these events actually arrive — even
+/// at a shell, where releasing it used to hand selection to herdr and starve
+/// the wheel (#75).
 ///
-/// A gesture that never leaves its cell is replayed to the app as a real click,
-/// so htop still sorts on a header click and lazygit still stages on a file
-/// click. Agent CLIs get it too: they never enabled mouse reporting, but claude
-/// and codex both discard the bytes cleanly, so withholding it only stood to
-/// swallow clicks the day one of them grows mouse support.
-///
-/// A shell is unaffected: the grab is released there, so herdr does its own
-/// native selection and none of this arrives.
+/// A TUI gesture that never leaves its cell is replayed to the app as a real
+/// click, so htop still sorts on a header click and lazygit still stages on a
+/// file click. Agent CLIs get it too: they never enabled mouse reporting, but
+/// claude and codex both discard the bytes cleanly, so withholding it only
+/// stood to swallow clicks the day one of them grows mouse support. A shell
+/// click is not replayed: the prompt never enabled mouse reporting, and the
+/// bytes would dump into it.
 ///
 /// The cost is an in-app *drag*: vim's mouse visual-select, a resize handle.
 fn mouse_action(fg: Option<Fg>, btn: u32, press: bool) -> MouseAction {
@@ -511,8 +514,11 @@ fn mouse_action(fg: Option<Fg>, btn: u32, press: bool) -> MouseAction {
         // modified scroll still scrolls instead of falling through as a click.
         b @ (4 | 5) if press => MouseAction::Scroll { up: b == 4 },
         6 | 7 => MouseAction::Drop,
-        0 if matches!(fg, Some(Fg::Agent) | Some(Fg::Mouse)) => MouseAction::Select,
-        // middle, right, wheel release and the extra buttons
+        0 if matches!(fg, Some(Fg::Agent) | Some(Fg::Mouse) | Some(Fg::Shell)) => {
+            MouseAction::Select
+        }
+        // middle, right, wheel release and the extra buttons — TUI/agent only.
+        // A shell never asked for these; forwarding them garbage the prompt.
         _ if matches!(fg, Some(Fg::Agent) | Some(Fg::Mouse)) => MouseAction::ForwardRaw,
         _ => MouseAction::Drop,
     }
@@ -708,9 +714,10 @@ struct App {
     /// scheduled delayed re-poll to catch a foreground change the last input just
     /// caused (e.g. quitting a TUI back to a shell); bypasses the throttle
     settle_at: Option<Instant>,
-    /// whether the local mouse grab (?1002h) is currently on. Released at a shell
-    /// so herdr does native selection/scroll; re-grabbed for a TUI so clicks can
-    /// be forwarded.
+    /// whether the local mouse grab (?1002h) is currently on. Always held so
+    /// wheel events reach us as terminal.scroll even at a shell; the pane is
+    /// on the alt screen and has no local scrollback, so a released grab
+    /// cannot scroll (#75).
     mouse_grabbed: bool,
     /// whether the local pane is currently in application cursor mode (?1h), held
     /// to match the remote's so forwarded arrows arrive in the form it expects
@@ -831,20 +838,20 @@ impl App {
         });
     }
 
-    /// Match the local mouse grab to the classification: release it at a shell so
-    /// herdr does native selection/scroll, keep it grabbed for a TUI (or while
-    /// unknown) so clicks can be forwarded. Only writes on a change.
+    /// Hold the local mouse grab for the streamer's whole lifetime. The pane
+    /// is always on the alt screen (no scrollback), so herdr's released-grab
+    /// wheel routing has nothing to move; ?1007l already prevents the
+    /// arrow-key hijacking that motivated the original shell-side release
+    /// (#69). Text selection stays in the plugin selector.
     fn sync_mouse_grab(&mut self) {
         if !self.tty {
             return;
         }
-        // grab unless we've confirmed the foreground is a shell
-        let want = self.remote_fg != Some(Fg::Shell);
-        if want == self.mouse_grabbed {
+        if self.mouse_grabbed {
             return;
         }
-        self.mouse_grabbed = want;
-        write_stdout(if want { "\x1b[?1002h\x1b[?1006h" } else { "\x1b[?1002l" });
+        self.mouse_grabbed = true;
+        write_stdout("\x1b[?1002h\x1b[?1006h");
     }
 
     /// Match the local pane's cursor-key mode to the remote's, so the arrow bytes
@@ -1245,16 +1252,16 @@ impl App {
             return;
         }
         // refresh the foreground classification on any input while active.
-        // keyboard reaches us even when the grab is released at a shell, so this
-        // is what catches a shell→TUI switch — a released grab means mouse events
-        // stop arriving here, so mouse alone can never trigger the re-poll.
+        // the grab is always held, so mouse events also trigger this — that's
+        // what catches a shell→TUI switch from a click, and the reverse from
+        // `:q`. keyboard still does too, for people who never touch the mouse.
         self.spawn_foreground_poll(false);
         // and re-check shortly after input settles, to catch a change the input
         // just caused (e.g. `:q` quitting vim — the poll above still sees vim)
         self.settle_at = Some(Instant::now() + SETTLE_DELAY);
         // wheel becomes a semantic scroll (server decides app vs scrollback);
-        // clicks/drags forward to the remote pty only when the foreground is a
-        // TUI — at a shell they're dropped so they don't garbage the prompt
+        // left-button drags go to the plugin selector; other TUI clicks/drags
+        // forward to the remote pty. a shell never sees raw SGR.
         let mut rest: Vec<u8> = Vec::with_capacity(buf.len());
         let mut i = 0usize;
         let mut scrolls: Vec<serde_json::Value> = Vec::new();
@@ -1283,16 +1290,16 @@ impl App {
                                 // the clipboard holds one thing, so a second
                                 // gesture in the same read legitimately wins
                                 Released::Selection(span) => copy_span = Some(span),
-                                // It was a click, not a drag: the app gets it,
-                                // whatever the app is. An earlier version
-                                // swallowed clicks in agent panes on the theory
-                                // that a program which never enabled mouse
-                                // reporting would render the bytes as literal
-                                // text. Measured against claude and codex, both
-                                // discard them cleanly, so the special case only
-                                // stood to swallow clicks the day an agent grows
-                                // mouse support.
-                                Released::Click(bytes) => rest.extend_from_slice(&bytes),
+                                // It was a click, not a drag. TUI/agent get it
+                                // (claude and codex discard the bytes cleanly).
+                                // A shell does not: the prompt never enabled
+                                // mouse reporting, and the bytes would dump
+                                // into it.
+                                Released::Click(bytes) => {
+                                    if self.remote_fg != Some(Fg::Shell) {
+                                        rest.extend_from_slice(&bytes);
+                                    }
+                                }
                                 Released::Nothing => {}
                             },
                         }
@@ -1448,16 +1455,12 @@ pub async fn run(args: Args) -> Result<()> {
         // drop otherwise arrives as bare text with no terminator at all. The
         // framing is stripped only to recognise a drop and put back on the way
         // out (`route_paste_body`), so the remote app still sees a paste.
-        // 1007 OFF (alternate scroll). It defaults to ON, and at a shell we
-        // release the grab so herdr can select natively — which leaves this
-        // pane as "alt screen, no mouse reporting, 1007 on", the one state
-        // where herdr's wheel routing types an Up/Down arrow per notch into the
-        // pane app. That app is us, so the arrows are forwarded to the remote
-        // and the shell walks its command history instead of scrolling (#69).
-        // Cleared, routing falls to host scroll, which on the alt screen has
-        // nothing to move: the wheel does nothing rather than the wrong thing.
-        // While the grab IS held this is never consulted — mouse reporting wins
-        // the routing — so nothing about the selection path changes.
+        // 1007 OFF (alternate scroll). The grab is always held, so mouse
+        // reporting wins the routing and 1007 is never consulted. Kept as a
+        // backstop: if the grab were ever lost, herdr would see "alt screen,
+        // no mouse reporting, 1007 on" and type an Up/Down arrow per wheel
+        // notch into us, which we'd forward, and a shell would walk command
+        // history instead of scrolling (#69).
         write_stdout("\x1b[?1049h\x1b[2J\x1b[H\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[?1007l");
         RawMode::enable()
     } else {
@@ -1711,7 +1714,7 @@ mod tests {
         // the wheel never reaches the selection path at all, which is what
         // keeps PR #54's scroll regression impossible here by construction
         assert_eq!(mouse_action(Some(Fg::Agent), 0, true), MouseAction::Select);
-        assert_eq!(mouse_action(Some(Fg::Shell), 0, true), MouseAction::Drop); // shell click
+        assert_eq!(mouse_action(Some(Fg::Shell), 0, true), MouseAction::Select); // shell drag-select
         assert_eq!(mouse_action(None, 0, true), MouseAction::Drop); // unclassified click
     }
 
@@ -1725,8 +1728,13 @@ mod tests {
             assert_eq!(mouse_action(Some(fg), 1, true), MouseAction::ForwardRaw);
             assert_eq!(mouse_action(Some(fg), 2, true), MouseAction::ForwardRaw);
         }
-        // a shell releases the grab, so these never arrive; unknown fails safe
-        assert_eq!(mouse_action(Some(Fg::Shell), 0, true), MouseAction::Drop);
+        // a shell holds the grab too, so the plugin selector runs; middle/right
+        // stay dropped so SGR never hits a prompt. unknown fails safe.
+        assert_eq!(mouse_action(Some(Fg::Shell), 0, true), MouseAction::Select);
+        assert_eq!(mouse_action(Some(Fg::Shell), 32, true), MouseAction::Select);
+        assert_eq!(mouse_action(Some(Fg::Shell), 0, false), MouseAction::Select);
+        assert_eq!(mouse_action(Some(Fg::Shell), 1, true), MouseAction::Drop);
+        assert_eq!(mouse_action(Some(Fg::Shell), 2, true), MouseAction::Drop);
         assert_eq!(mouse_action(None, 0, true), MouseAction::Drop);
     }
 
