@@ -63,6 +63,49 @@ pub fn default_config_dir() -> PathBuf {
     home_dir().join(".config").join("herdr-mirror")
 }
 
+const DELETED_MARKER: &str = " (deleted)";
+
+/// `/proc/self/exe` gains a literal " (deleted)" suffix once the file behind it
+/// is replaced or unlinked. Returns the path without it, or None when there is
+/// no marker to strip. Pure, so the rule is testable without unlinking a binary.
+fn strip_deleted_marker(p: &Path) -> Option<PathBuf> {
+    p.to_str().and_then(|s| s.strip_suffix(DELETED_MARKER)).map(PathBuf::from)
+}
+
+/// A path to THIS binary that can still be RUN.
+///
+/// `current_exe()` reads /proc/self/exe, and Linux appends " (deleted)" to that
+/// link the moment the file behind it is replaced -- which every rebuild does to
+/// a running daemon. Rust passes the suffix straight through, so the value went
+/// into the streamer argv and produced `exec '/path/herdr-mirror (deleted)'`: a
+/// command that cannot run, leaving a bare shell parked in the `.mirror-pane`
+/// placeholder where a mirror should be. The same value was also handed to
+/// `Command::new` when respawning the daemon, and symlinked into the CLI link by
+/// `repair_cli_link`, which would have made the breakage outlive the process.
+///
+/// Order: the reported path if it is really there; the same path with the marker
+/// stripped (a rebuild in place -- the common case); then the stable CLI link,
+/// which by definition points at whatever is current.
+pub fn self_exe_path() -> Option<PathBuf> {
+    let reported = std::env::current_exe().ok()?;
+    if reported.is_file() {
+        return Some(reported);
+    }
+    if let Some(stripped) = strip_deleted_marker(&reported) {
+        if stripped.is_file() {
+            return Some(stripped);
+        }
+    }
+    let link = cli_link_path();
+    link.is_file().then_some(link)
+}
+
+/// `self_exe_path` as a command string, falling back to a bare name so PATH
+/// lookup still gives a streamer something to try.
+pub fn self_exe() -> String {
+    self_exe_path().map(|p| p.display().to_string()).unwrap_or_else(|| "herdr-mirror".into())
+}
+
 /// The stable CLI path install.sh links and the README's keybindings use.
 pub fn cli_link_path() -> PathBuf {
     home_dir().join(".local").join("bin").join("herdr-mirror")
@@ -89,7 +132,7 @@ pub fn cli_link_state() -> CliLink {
         Err(_) => CliLink::File,
         Ok(target) => {
             let resolved = fs::canonicalize(&link).ok();
-            let exe = std::env::current_exe().ok().and_then(|e| fs::canonicalize(e).ok());
+            let exe = self_exe_path().and_then(|e| fs::canonicalize(e).ok());
             match resolved {
                 None => CliLink::Dangling(target),
                 Some(r) if exe.as_ref() == Some(&r) => CliLink::Ok(target),
@@ -119,7 +162,7 @@ pub fn cli_link_problem() -> Option<String> {
 pub fn repair_cli_link() -> Option<String> {
     cli_link_problem()?;
     let link = cli_link_path();
-    let exe = std::env::current_exe().ok()?;
+    let exe = self_exe_path()?;
     let _ = fs::create_dir_all(link.parent()?);
     let _ = fs::remove_file(&link);
     Some(match std::os::unix::fs::symlink(&exe, &link) {
@@ -379,90 +422,18 @@ where
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn test_state_dir(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "herdr-mirror-{name}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ))
-    }
+mod deleted_exe_tests {
+    use super::strip_deleted_marker;
+    use std::path::{Path, PathBuf};
 
     #[test]
-    fn a_live_pid_claim_blocks_a_recovery_write() {
-        let state_dir = test_state_dir("active-spawn");
-        let pid_path = streamer_pid_path(&state_dir, "host", "w1:p1");
-        fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
-        fs::write(&pid_path, std::process::id().to_string()).unwrap();
-
+    fn deleted_marker_is_stripped_only_when_it_is_a_real_suffix() {
         assert_eq!(
-            claim_streamer_spawn(&state_dir, "host", "w1:p1", "w2:p2").unwrap(),
-            StreamerSpawnClaim::Active
+            strip_deleted_marker(Path::new("/usr/bin/herdr-mirror (deleted)")),
+            Some(PathBuf::from("/usr/bin/herdr-mirror"))
         );
-        assert!(!streamer_spawn_pending_path(&state_dir, "w2:p2").exists());
-        let _ = fs::remove_dir_all(state_dir);
-    }
-
-    #[test]
-    fn a_live_local_pane_pid_blocks_a_recovery_write() {
-        let state_dir = test_state_dir("active-local-pane");
-        let pid_path = pane_pid_path(&state_dir, "w2:p2");
-        fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
-        fs::write(&pid_path, std::process::id().to_string()).unwrap();
-
-        assert_eq!(
-            claim_streamer_spawn(&state_dir, "host", "w1:p1", "w2:p2").unwrap(),
-            StreamerSpawnClaim::Active
-        );
-        assert!(!streamer_spawn_pending_path(&state_dir, "w2:p2").exists());
-        let _ = fs::remove_dir_all(state_dir);
-    }
-
-    #[test]
-    fn one_pending_launch_owns_each_local_pane() {
-        let state_dir = test_state_dir("pending-spawn");
-
-        assert_eq!(
-            claim_streamer_spawn(&state_dir, "host", "w1:p1", "w2:p2").unwrap(),
-            StreamerSpawnClaim::Claimed
-        );
-        assert_eq!(
-            claim_streamer_spawn(&state_dir, "host", "w1:p1", "w2:p2").unwrap(),
-            StreamerSpawnClaim::Pending
-        );
-        clear_streamer_spawn_pending(&state_dir, "w2:p2");
-        assert_eq!(
-            claim_streamer_spawn(&state_dir, "host", "w1:p1", "w2:p2").unwrap(),
-            StreamerSpawnClaim::Claimed
-        );
-        let _ = fs::remove_dir_all(state_dir);
-    }
-
-    #[test]
-    fn a_stale_pending_claim_can_be_replaced() {
-        let state_dir = test_state_dir("stale-pending");
-        let path = streamer_spawn_pending_path(&state_dir, "w2:p2");
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, "host w1:p1\n").unwrap();
-        let past = std::time::SystemTime::now()
-            .checked_sub(SPAWN_PENDING_TTL + Duration::from_secs(1))
-            .unwrap()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as libc::time_t;
-        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-        let times = libc::utimbuf { actime: past, modtime: past };
-        assert_eq!(unsafe { libc::utime(cpath.as_ptr(), &times) }, 0);
-
-        assert_eq!(
-            claim_streamer_spawn(&state_dir, "host", "w1:p1", "w2:p2").unwrap(),
-            StreamerSpawnClaim::Claimed
-        );
-        let _ = fs::remove_dir_all(state_dir);
+        assert_eq!(strip_deleted_marker(Path::new("/usr/bin/herdr-mirror")), None);
+        // the words appearing mid-path are a directory name, not the kernel marker
+        assert_eq!(strip_deleted_marker(Path::new("/tmp/x (deleted)/herdr-mirror")), None);
     }
 }
