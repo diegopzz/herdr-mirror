@@ -9,6 +9,9 @@ and drive.
   <img src="assets/hero.png" width="720" alt="herdr-mirror: local and remote herdr sessions unified in one window">
 </p>
 
+> 🐾 Check out my other plugin: [herdr-pet](https://github.com/nikok6/herdr-pet), a tiny
+> desk pet on your panes that types, waits, and celebrates with your agent.
+
 Each remote workspace becomes a real local workspace named `<host>: <name>`.
 Its panes stream the remote terminal live; its agents report their real state.
 Mirroring is one-way (the remote needs no plugin — just herdr), but you can
