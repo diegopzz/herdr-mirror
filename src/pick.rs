@@ -710,6 +710,7 @@ fn run_menu(rows: &[Row], note: Option<&str>) -> Result<Option<usize>> {
             // a click on an option row picks it outright; anywhere else ignores
             Key::Click { y } => {
                 let idx = (y as usize).checked_sub(FIRST_ROW_Y).filter(|i| *i < rows.len());
+                log_click(y, idx, rows.len());
                 match idx {
                     // NEVER let a CLICK resolve to row 0, "this machine".
                     //
@@ -756,6 +757,16 @@ fn run_menu(rows: &[Row], note: Option<&str>) -> Result<Option<usize>> {
 /// so the two can no longer disagree about where the list actually is.
 const FIRST_ROW_Y: usize = 6;
 
+/// Record every click so the row mapping above can be CALIBRATED against a real
+/// event instead of assumed. Appends one line to
+/// ~/.local/state/herdr-mirror/click-debug.log; best-effort, never fails a pick.
+fn log_click(y: u32, idx: Option<usize>, n_rows: usize) {
+    let Ok(home) = std::env::var("HOME") else { return };
+    let path = std::path::Path::new(&home).join(".local/state/herdr-mirror/click-debug.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "click y={y} -> idx={idx:?} (FIRST_ROW_Y={FIRST_ROW_Y}, rows={n_rows})");
+    }
+}
 
 fn draw(out: &mut impl Write, rows: &[Row], sel: usize, note: Option<&str>) {
     // full redraw each keypress: the popup is tiny and this keeps it stateless
