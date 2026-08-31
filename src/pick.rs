@@ -216,16 +216,36 @@ pub async fn intercept(env: Env, what: &str) -> Result<()> {
         "tab" | "pane" => {
             intercept_in_mirror(&env, &api, &config, &placeholder, what, &target).await
         }
-        _ => intercept_workspace(&env, &api, &placeholder, &target).await,
+        _ => intercept_workspace(&env, &api, &config, &placeholder, &target).await,
     }
+}
+
+/// Marker file written by `create_local` immediately before it creates, so the
+/// workspace the picker itself makes cannot be fed straight back into the
+/// picker. The mirror arm's `intercept-acted` marker is a different thing: a
+/// blanket one-action-per-window cap, sized for a feedback loop between the
+/// daemon and the hook rather than for this exact hand-off.
+const PICKED_MARKER: &str = "picker-created";
+
+fn marker_fresh(env: &Env, name: &str, secs: u64) -> bool {
+    std::fs::metadata(env.state_dir.join(name))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|e| e < std::time::Duration::from_secs(secs))
 }
 
 async fn intercept_workspace(
     env: &Env,
     api: &ApiClient,
+    config: &crate::config::MirrorConfig,
     placeholder: &std::path::Path,
     target: &str,
 ) -> Result<()> {
+    // The picker's own workspace must never re-enter the picker.
+    if marker_fresh(env, PICKED_MARKER, 10) {
+        return Ok(());
+    }
     let ws: Value = api.request("workspace.list", json!({})).await?;
     // the workspace the EVENT named, not whatever happens to be focused now
     let Some(w) = ws.get("workspaces").and_then(Value::as_array).and_then(|a| {
@@ -233,9 +253,7 @@ async fn intercept_workspace(
     }) else {
         return Ok(());
     };
-    if w.get("label").and_then(Value::as_str) != Some(".mirror-pane")
-        || w.get("pane_count").and_then(Value::as_u64) != Some(1)
-    {
+    if w.get("pane_count").and_then(Value::as_u64) != Some(1) {
         return Ok(());
     }
     let Some(ws_id) = w.get("workspace_id").and_then(Value::as_str) else { return Ok(()) };
@@ -246,8 +264,23 @@ async fn intercept_workspace(
     }) else {
         return Ok(());
     };
-    if !is_bare_placeholder(p, placeholder) {
+    // An agent pane is somebody's work, wherever it came from.
+    if p.get("agent").is_some_and(|a| !a.is_null()) {
         return Ok(());
+    }
+    // Two shapes reach the picker now. The first is native junk created from
+    // inside a mirror: a bare pane sitting in the `.mirror-pane` placeholder,
+    // junk by construction and always ours to close. The second is a plain new
+    // LOCAL workspace -- previously passed straight through, which is why the
+    // picker appeared only when you were already inside a mirror. Offering the
+    // same choice either way is the point of this arm (BYT-664).
+    if !is_bare_placeholder(p, placeholder) {
+        let Some(pane_id) = p.get("pane_id").and_then(Value::as_str) else { return Ok(()) };
+        // A daemon-built mirror workspace also looks bare for the moment before
+        // its map entry and its streamer land. Never eat one of those.
+        if settles_as_ours(env, api, config, pane_id).await {
+            return Ok(());
+        }
     }
 
     api.request("workspace.close", json!({ "workspace_id": ws_id })).await?;
@@ -637,6 +670,10 @@ async fn create_local(env: &Env) -> Result<()> {
         .filter(|s| !s.is_empty())
         .or_else(|| std::env::var("HOME").ok())
         .filter(|s| !s.is_empty());
+    // Claim this create before making it: the workspace.created hook now also
+    // offers the picker for plain local workspaces, and without this the
+    // picker's own result would bounce straight back into the picker.
+    let _ = std::fs::write(env.state_dir.join(PICKED_MARKER), b"");
     let res: Value = api.request("workspace.create", json!({ "cwd": cwd, "focus": true })).await?;
     println!(
         "created local workspace {}",
