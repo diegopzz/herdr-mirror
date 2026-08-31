@@ -151,11 +151,6 @@ pub struct MirrorConfig {
     /// through; closing a whole workspace only stops mirroring — one wrong
     /// prefix+x can cost a pane, never every agent in a workspace).
     pub close_remote_on_local_close: CloseThrough,
-    /// when true (the default), a native workspace create that lands in the
-    /// `.mirror-pane` placeholder (the sidebar's unrebindable "+" clicked from
-    /// inside a mirror) is closed and replaced by the host picker popup. Set
-    /// false to leave native creation entirely alone.
-    pub intercept_native_create: bool,
     pub hosts: Vec<HostConfig>,
     /// which hosts.toml this came from. `None` when parsed from a string
     /// (tests). Logged at startup so "which config won?" is never a guess.
@@ -186,7 +181,6 @@ struct RawConfig {
     // bool or the string "panes" — validated in parse (a typo must warn, not
     // silently become a default that closes remote agents)
     close_remote_on_local_close: Option<toml::Value>,
-    intercept_native_create: Option<bool>,
     always_control: Option<bool>,
     max_cols: Option<usize>,
     max_rows: Option<usize>,
@@ -392,7 +386,6 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
         autostart: raw.autostart.unwrap_or(true),
         default_host: raw.default_host,
         close_remote_on_local_close: close_through,
-        intercept_native_create: raw.intercept_native_create.unwrap_or(true),
         hosts,
         source: None,
         shadowed: Vec::new(),
@@ -439,13 +432,6 @@ mod tests {
         assert!(c.warnings.iter().any(|w| w.contains("close_remote_on_local_close")));
     }
 
-    #[test]
-    fn intercept_native_create_defaults_on_and_can_be_disabled() {
-        let c = parse_config("[hosts.a]\ntarget = \"a\"\n").unwrap();
-        assert!(c.intercept_native_create); // default on
-        let c = parse_config("intercept_native_create = false\n[hosts.a]\ntarget = \"a\"\n").unwrap();
-        assert!(!c.intercept_native_create);
-    }
 
     #[test]
     fn always_control_global_default_and_per_host_override() {

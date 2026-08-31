@@ -113,14 +113,46 @@ async fn open_popup(api: &ApiClient, env: &Env) -> Result<()> {
 /// because the daemon persists their map entry the moment each one is
 /// created (see mirror::note_mapped) — the settle delay below is what gives
 /// that write time to land before the map is read.
-pub async fn intercept(env: Env, what: &str) -> Result<()> {
-    // opt-out: hosts.toml `intercept_native_create = false` leaves native
-    // creation alone entirely (an unreadable config keeps the default on —
-    // the guards below can't misfire without a mirror placeholder to match)
-    let config = load_config(&env.config_search).ok();
-    if let Some(c) = &config {
-        if !c.intercept_native_create {
-            return Ok(());
+/// Is this pane the daemon's, rather than native junk?
+///
+/// Two independent signals, because neither alone is safe. The map is
+/// authoritative but written *after* the pane exists, so a fresh mirror pane is
+/// briefly unmapped. A running streamer proves ownership outright but only lands
+/// once the typed `exec` has taken. Polling both for a couple of seconds turns a
+/// 250ms race into one with a wide margin, and it costs nothing in the case that
+/// matters: genuine native junk is never mapped and never grows a streamer, so
+/// the wait always expires and we still act.
+async fn settles_as_ours(
+    env: &Env,
+    api: &ApiClient,
+    config: &crate::config::MirrorConfig,
+    pane_id: &str,
+) -> bool {
+    for attempt in 0..8 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        for h in &config.hosts {
+            let state = crate::state::load_state(&env.state_dir, &h.name);
+            if state.panes.values().any(|e| e.local_id == pane_id) {
+                return true;
+            }
+        }
+        if let Ok(v) = api.request("pane.process_info", json!({ "pane_id": pane_id })).await {
+            let running = v
+                .pointer("/process_info/foreground_processes")
+                .and_then(Value::as_array)
+                .is_some_and(|procs| {
+                    procs.iter().any(|p| {
+                        p.get("argv").and_then(Value::as_array).is_some_and(|argv| {
+                            argv.first().and_then(Value::as_str).is_some_and(|e| e.ends_with("herdr-mirror"))
+                                && argv.get(1).and_then(Value::as_str) == Some("pane")
+                        })
+                    })
+                });
+            if running {
+                return true;
+            }
         }
     }
     false
@@ -780,9 +812,6 @@ fn ssh_host(target: &str) -> HostConfig {
         remote_bin: None,
         session: None,
         api_transport: crate::config::ApiTransport::Auto,
-        // branch-local field: this probe host never mirrors a pane, so the
-        // mouse-local app list is irrelevant to it
-        mouse_local_apps: Vec::new(),
         always_control: false,
         max_cols: None,
         max_rows: None,

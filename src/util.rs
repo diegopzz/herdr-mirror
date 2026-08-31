@@ -437,3 +437,92 @@ mod deleted_exe_tests {
         assert_eq!(strip_deleted_marker(Path::new("/tmp/x (deleted)/herdr-mirror")), None);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_state_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "herdr-mirror-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn a_live_pid_claim_blocks_a_recovery_write() {
+        let state_dir = test_state_dir("active-spawn");
+        let pid_path = streamer_pid_path(&state_dir, "host", "w1:p1");
+        fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
+        fs::write(&pid_path, std::process::id().to_string()).unwrap();
+
+        assert_eq!(
+            claim_streamer_spawn(&state_dir, "host", "w1:p1", "w2:p2").unwrap(),
+            StreamerSpawnClaim::Active
+        );
+        assert!(!streamer_spawn_pending_path(&state_dir, "w2:p2").exists());
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn a_live_local_pane_pid_blocks_a_recovery_write() {
+        let state_dir = test_state_dir("active-local-pane");
+        let pid_path = pane_pid_path(&state_dir, "w2:p2");
+        fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
+        fs::write(&pid_path, std::process::id().to_string()).unwrap();
+
+        assert_eq!(
+            claim_streamer_spawn(&state_dir, "host", "w1:p1", "w2:p2").unwrap(),
+            StreamerSpawnClaim::Active
+        );
+        assert!(!streamer_spawn_pending_path(&state_dir, "w2:p2").exists());
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn one_pending_launch_owns_each_local_pane() {
+        let state_dir = test_state_dir("pending-spawn");
+
+        assert_eq!(
+            claim_streamer_spawn(&state_dir, "host", "w1:p1", "w2:p2").unwrap(),
+            StreamerSpawnClaim::Claimed
+        );
+        assert_eq!(
+            claim_streamer_spawn(&state_dir, "host", "w1:p1", "w2:p2").unwrap(),
+            StreamerSpawnClaim::Pending
+        );
+        clear_streamer_spawn_pending(&state_dir, "w2:p2");
+        assert_eq!(
+            claim_streamer_spawn(&state_dir, "host", "w1:p1", "w2:p2").unwrap(),
+            StreamerSpawnClaim::Claimed
+        );
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn a_stale_pending_claim_can_be_replaced() {
+        let state_dir = test_state_dir("stale-pending");
+        let path = streamer_spawn_pending_path(&state_dir, "w2:p2");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "host w1:p1\n").unwrap();
+        let past = std::time::SystemTime::now()
+            .checked_sub(SPAWN_PENDING_TTL + Duration::from_secs(1))
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as libc::time_t;
+        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        let times = libc::utimbuf { actime: past, modtime: past };
+        assert_eq!(unsafe { libc::utime(cpath.as_ptr(), &times) }, 0);
+
+        assert_eq!(
+            claim_streamer_spawn(&state_dir, "host", "w1:p1", "w2:p2").unwrap(),
+            StreamerSpawnClaim::Claimed
+        );
+        let _ = fs::remove_dir_all(state_dir);
+    }
+}
