@@ -36,10 +36,18 @@ pub async fn summon(env: Env) -> Result<()> {
 }
 
 async fn open_popup(api: &ApiClient, env: &Env) -> Result<()> {
+    open_popup_at(api, env, None).await
+}
+
+/// `cwd_override` is for the interception hook, which runs as its own process
+/// with no invoking pane: `invoking_cwd` would find nothing and the local
+/// choice would silently fall back to `$HOME`, losing the directory the user
+/// was actually in. The hook passes the cwd of the workspace it just closed.
+async fn open_popup_at(api: &ApiClient, env: &Env, cwd_override: Option<String>) -> Result<()> {
     // size the popup to its content: options + title + hints + border. Width
     // tracks the longest row (name + its dim subtitle) so targets and the cwd
     // hint aren't truncated the moment they matter.
-    let cwd = invoking_cwd();
+    let cwd = cwd_override.or_else(invoking_cwd);
     let (n_hosts, widest) = match load_config(&env.config_search) {
         Ok(c) => {
             let w = c
@@ -283,8 +291,17 @@ async fn intercept_workspace(
         }
     }
 
+    // Keep the directory. The workspace being closed is the one the user just
+    // made, and its cwd is the one they expect to land in -- except when it is
+    // the placeholder, which is a decoy dir and never wanted.
+    let keep_cwd = p
+        .get("cwd")
+        .and_then(Value::as_str)
+        .filter(|c| !c.ends_with("/.mirror-pane"))
+        .map(str::to_string);
+
     api.request("workspace.close", json!({ "workspace_id": ws_id })).await?;
-    open_popup(api, env).await
+    open_popup_at(api, env, keep_cwd).await
 }
 
 fn is_bare_placeholder(pane: &Value, placeholder: &std::path::Path) -> bool {
