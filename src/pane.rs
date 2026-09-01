@@ -927,9 +927,20 @@ impl App {
         match spawn_session(&self.args, m, cols, rows, self.next_gen, self.tx.clone()) {
             Ok(mut s) => {
                 if m == Mode::Control {
-                    self.last_input = Instant::now();
                     // keystrokes typed while the control session was spinning up
-                    for buf in std::mem::take(&mut self.pending_input) {
+                    let queued = std::mem::take(&mut self.pending_input);
+                    // Only real typing restarts the idle countdown. Resetting it
+                    // on every control connect meant a reconnect — which sleep,
+                    // a flaky link, or a laptop lid reliably produce — pushed the
+                    // release another full hour out without anyone touching the
+                    // keyboard. A pane that reconnected even once an hour never
+                    // released at all, holding the remote's control lock on a
+                    // host configured `always_control = false` precisely because
+                    // a human sits at it.
+                    if !queued.is_empty() {
+                        self.last_input = Instant::now();
+                    }
+                    for buf in queued {
                         let line = json!({ "type": "terminal.input", "bytes": B64.encode(&buf) }).to_string() + "\n";
                         let _ = s.stdin.write_all(line.as_bytes()).await;
                     }
@@ -1557,12 +1568,13 @@ pub async fn run(args: Args) -> Result<()> {
 
     loop {
         // earliest pending deadline: mode-switch gap, reconnect, hint clear, idle release
-        let idle_at = (app.mode == Mode::Control
-            && app.switching_to.is_none()
-            && app.session.is_some()
-            && !app.args.always_control
-            && app.args.control_idle_secs > 0)
-            .then(|| app.last_input + Duration::from_secs(app.args.control_idle_secs));
+        let idle_at = idle_release_at(
+            app.mode,
+            app.switching_to,
+            app.args.always_control,
+            app.args.control_idle_secs,
+            app.last_input,
+        );
         let sleep = crate::util::sleep_until_earliest([
             app.switch_at,
             app.reconnect_at.map(|(t, _)| t),
@@ -1681,9 +1693,79 @@ pub async fn run(args: Args) -> Result<()> {
     Ok(())
 }
 
+/// When control should hand itself back, or `None` when it should not.
+///
+/// Extracted from the event loop so the rule is testable rather than asserted
+/// by eye. Two things it deliberately does *not* consider:
+///
+/// * **Whether a session is live.** Time spent disconnected is still time
+///   nobody typed. Stopping the clock there meant an overnight sleep came back
+///   still claiming control — the pane reconnected into Control and re-took the
+///   remote instead of returning to read-only.
+/// * **Reconnects.** The caller only refreshes `last_input` on real keystrokes;
+///   resetting it on every control connect pushed the release another full hour
+///   out each time the link flapped, so a pane that reconnected once an hour
+///   never released at all.
+fn idle_release_at(
+    mode: Mode,
+    switching_to: Option<Mode>,
+    always_control: bool,
+    control_idle_secs: u64,
+    last_input: Instant,
+) -> Option<Instant> {
+    (mode == Mode::Control
+        && switching_to.is_none()
+        && !always_control
+        && control_idle_secs > 0)
+        .then(|| last_input + Duration::from_secs(control_idle_secs))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const HOUR: u64 = 3_600;
+
+    #[test]
+    fn control_releases_an_hour_after_the_last_real_keystroke() {
+        let typed = Instant::now();
+        let at = idle_release_at(Mode::Control, None, false, HOUR, typed)
+            .expect("a control pane with an idle timeout must schedule a release");
+        assert_eq!(at, typed + Duration::from_secs(HOUR));
+    }
+
+    #[test]
+    fn a_disconnected_pane_still_counts_down_to_release() {
+        // The regression: the release used to require a live session, so an
+        // overnight sleep came back still claiming control instead of handing
+        // back to the human at the remote. Liveness is not an argument here at
+        // all, which is the point.
+        let typed = Instant::now();
+        assert!(
+            idle_release_at(Mode::Control, None, false, HOUR, typed).is_some(),
+            "time spent disconnected is still time nobody typed"
+        );
+    }
+
+    #[test]
+    fn always_control_never_releases() {
+        assert!(idle_release_at(Mode::Control, None, true, HOUR, Instant::now()).is_none());
+    }
+
+    #[test]
+    fn observe_and_in_flight_switches_schedule_no_release() {
+        assert!(idle_release_at(Mode::Observe, None, false, HOUR, Instant::now()).is_none());
+        assert!(
+            idle_release_at(Mode::Control, Some(Mode::Observe), false, HOUR, Instant::now())
+                .is_none(),
+            "a switch already under way must not race a second one"
+        );
+    }
+
+    #[test]
+    fn a_zero_timeout_disables_the_release() {
+        assert!(idle_release_at(Mode::Control, None, false, 0, Instant::now()).is_none());
+    }
 
     /// Uncapped must stay byte-identical to the old `term_size()` call, or
     /// every existing headless-remote config silently changes behaviour.
